@@ -1,6 +1,6 @@
 Gem::Specification.new do |spec|
   spec.name          = "rbs-sentinel"
-  spec.version       = "0.5.0"
+  spec.version       = "0.6.0"
   spec.executables   = ["sentinel"]
   spec.bindir        = "bin"
   spec.authors       = ["Andrew Gauger"]
