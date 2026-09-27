@@ -10,7 +10,7 @@ RBS type signature generator for Rails — Rust-powered, CI-ready.
 Add Sentinel to your Gemfile:
 ```
     group :development do
-      gem 'sentinel'
+      gem 'rbs-sentinel'
     end
 ```
 Then run:
