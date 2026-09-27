@@ -1,3 +1,4 @@
 /target
 editors/zed/target
+editors/zed/extension.wasm
 book/book
