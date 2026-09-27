@@ -1,4 +1,4 @@
-use crate::plugin::{AngleBracketPlugin, SentinelPlugin, TypeCasePlugin, VoidArgumentPlugin};
+use crate::plugin::Plugin;
 use crate::transpiler::SentinelTranspiler;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -29,12 +29,6 @@ pub fn run(app_path: &Path, output_path: &Path, shared_paths: &[PathBuf], emit_s
     let total = files.len();
     println!("Found {} Ruby files in {:?}", total, app_path);
 
-    let plugins: Vec<Box<dyn SentinelPlugin>> = vec![
-        Box::new(VoidArgumentPlugin),
-        Box::new(TypeCasePlugin),
-        Box::new(AngleBracketPlugin),
-    ];
-
     let success = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
@@ -51,7 +45,7 @@ pub fn run(app_path: &Path, output_path: &Path, shared_paths: &[PathBuf], emit_s
                     return;
                 }
 
-                for plugin in &plugins {
+                for plugin in Plugin::ALL {
                     let issues = plugin.check(&rbs_content);
                     if !issues.is_empty() {
                         eprintln!(

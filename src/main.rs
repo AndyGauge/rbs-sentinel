@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
             for folder in config.folder_paths() {
                 init::run(&folder, &config.output_path(), &shared, config.emit_superclasses);
             }
-            let watcher = SentinelWatcher::new(&config)?.with_plugins();
+            let watcher = SentinelWatcher::new(&config)?;
             watcher.run().await;
         }
         "add" => {

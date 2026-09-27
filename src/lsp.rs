@@ -17,7 +17,7 @@
 
 use crate::config::SentinelConfig;
 use crate::init::derive_sig_path;
-use crate::plugin::{AngleBracketPlugin, SentinelPlugin, TypeCasePlugin, VoidArgumentPlugin};
+use crate::plugin::Plugin;
 use crate::transpiler::SentinelTranspiler;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
@@ -49,14 +49,6 @@ impl Backend {
             client,
             state: Mutex::new(State::default()),
         }
-    }
-
-    fn plugins() -> Vec<Box<dyn SentinelPlugin>> {
-        vec![
-            Box::new(VoidArgumentPlugin),
-            Box::new(TypeCasePlugin),
-            Box::new(AngleBracketPlugin),
-        ]
     }
 
     /// Which configured watched folder (if any) contains `path`.
@@ -189,7 +181,7 @@ impl Backend {
         let source_lines: Vec<&str> = source.lines().collect();
 
         let mut diagnostics = Vec::new();
-        for plugin in Self::plugins() {
+        for plugin in Plugin::ALL {
             for (method, message) in plugin.check(&rbs_content) {
                 let line = Self::locate_method(&source_lines, &method);
                 diagnostics.push(Diagnostic {

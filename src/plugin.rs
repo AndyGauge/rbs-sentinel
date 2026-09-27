@@ -1,9 +1,21 @@
-pub trait SentinelPlugin: Send + Sync {
+/// The contract every lint plugin implements.
+///
+/// To add a plugin: copy one of the structs below as a starting point,
+/// `impl SentinelPlugin for YourPlugin`, then add a `Plugin::YourPlugin(YourPlugin)`
+/// variant and one match arm in each of `Plugin::name`/`Plugin::check`.
+///
+/// Plugins are dispatched through the `Plugin` enum below, not
+/// `Box<dyn SentinelPlugin>`. The set is small, fixed, and known entirely at
+/// compile time — nothing registers a plugin from outside this crate — so a
+/// `match` costs nothing over a vtable call and, unlike `Vec<Box<dyn ...>>`,
+/// never heap-allocates to hold what is, per plugin, a zero-sized type.
+pub trait SentinelPlugin {
     fn name(&self) -> &str;
     // Updated to return (MethodName, ErrorMessage) for better Ruby-side context
     fn check(&self, content: &str) -> Vec<(String, String)>;
 }
 
+#[derive(Clone, Copy)]
 pub struct VoidArgumentPlugin;
 
 impl SentinelPlugin for VoidArgumentPlugin {
@@ -36,6 +48,7 @@ impl SentinelPlugin for VoidArgumentPlugin {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct AngleBracketPlugin;
 
 impl SentinelPlugin for AngleBracketPlugin {
@@ -152,6 +165,7 @@ mod angle_bracket_tests {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct TypeCasePlugin;
 
 impl SentinelPlugin for TypeCasePlugin {
@@ -300,5 +314,57 @@ mod type_case_tests {
     fn tracks_method_name() {
         let issues = check("  def my_method: (string) -> void");
         assert_eq!(issues[0].0, "my_method");
+    }
+}
+
+/// Every built-in lint plugin, in the order `check`/`init`/`watch`/`lsp` run
+/// them. `Copy`: each variant wraps a zero-sized unit struct, so `Plugin::ALL`
+/// and every value of this type cost nothing to construct or pass around.
+#[derive(Clone, Copy)]
+pub enum Plugin {
+    VoidArgument(VoidArgumentPlugin),
+    AngleBracket(AngleBracketPlugin),
+    TypeCase(TypeCasePlugin),
+}
+
+impl Plugin {
+    pub const ALL: [Plugin; 3] = [
+        Plugin::VoidArgument(VoidArgumentPlugin),
+        Plugin::AngleBracket(AngleBracketPlugin),
+        Plugin::TypeCase(TypeCasePlugin),
+    ];
+
+    pub fn name(&self) -> &str {
+        match self {
+            Plugin::VoidArgument(p) => p.name(),
+            Plugin::AngleBracket(p) => p.name(),
+            Plugin::TypeCase(p) => p.name(),
+        }
+    }
+
+    pub fn check(&self, content: &str) -> Vec<(String, String)> {
+        match self {
+            Plugin::VoidArgument(p) => p.check(content),
+            Plugin::AngleBracket(p) => p.check(content),
+            Plugin::TypeCase(p) => p.check(content),
+        }
+    }
+}
+
+#[cfg(test)]
+mod plugin_enum_tests {
+    use super::*;
+
+    #[test]
+    fn plugin_is_tiny_and_stack_only() {
+        // Confirms the zero-allocation claim: no heap, minimal footprint.
+        assert!(std::mem::size_of::<Plugin>() <= 1);
+        assert_eq!(std::mem::size_of::<[Plugin; 3]>(), std::mem::size_of::<Plugin>() * 3);
+    }
+
+    #[test]
+    fn all_covers_every_plugin_by_name() {
+        let names: Vec<&str> = Plugin::ALL.iter().map(|p| p.name()).collect();
+        assert_eq!(names, vec!["Void Argument", "Angle Bracket", "Type Case"]);
     }
 }

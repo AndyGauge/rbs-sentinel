@@ -1,5 +1,5 @@
 use crate::config::SentinelConfig;
-use crate::plugin::{AngleBracketPlugin, SentinelPlugin, TypeCasePlugin, VoidArgumentPlugin};
+use crate::plugin::Plugin;
 use crate::transpiler::SentinelTranspiler;
 use anyhow::Result;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
@@ -15,7 +15,6 @@ pub struct SentinelWatcher {
     app_roots: Vec<PathBuf>,
     output_path: PathBuf,
     shared_paths: Vec<PathBuf>,
-    plugins: Vec<Box<dyn SentinelPlugin>>,
 }
 
 impl SentinelWatcher {
@@ -43,16 +42,7 @@ impl SentinelWatcher {
             app_roots,
             output_path: config.output_path(),
             shared_paths: config.shared_type_paths(),
-            plugins: Vec::new(),
         })
-    }
-
-    /// Register default plugins for RBS linting
-    pub fn with_plugins(mut self) -> Self {
-        self.plugins.push(Box::new(VoidArgumentPlugin));
-        self.plugins.push(Box::new(TypeCasePlugin));
-        self.plugins.push(Box::new(AngleBracketPlugin));
-        self
     }
 
     /// Check if a path is a real .rb file (not a temp file from sed, editors, etc.)
@@ -123,7 +113,7 @@ impl SentinelWatcher {
         match transpiler.transpile_file(path) {
             Ok(rbs_content) => {
                 // 1. RUN PLUGINS (The new linter system)
-                for plugin in &self.plugins {
+                for plugin in Plugin::ALL {
                     let issues = plugin.check(&rbs_content);
                     if !issues.is_empty() {
                         eprintln!(
