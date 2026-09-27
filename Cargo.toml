@@ -27,5 +27,8 @@ toml = "0.8"
 # Errors
 anyhow = "1.0"
 
+# LSP server (`sentinel lsp`) - publishes plugin diagnostics straight into the editor
+tower-lsp = "0.20"
+
 [dev-dependencies]
 tempfile = "3"

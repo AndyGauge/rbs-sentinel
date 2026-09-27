@@ -177,25 +177,128 @@ impl SentinelPlugin for TypeCasePlugin {
                     .to_string();
             }
 
-            for p in primitives {
-                // We use word boundaries or specific markers like '(' or ' '
-                // to avoid accidental matches (like "string_helper")
-                let patterns = [
-                    format!("({})", p),  // e.g., (string)
-                    format!(": {}", p),  // e.g., : string
-                    format!("[{}]", p),  // e.g., Array[string]
-                    format!("-> {}", p), // e.g., -> string
-                ];
+            let bytes = line.as_bytes();
 
-                if patterns.iter().any(|pat| line.contains(pat)) {
-                    issues.push((
-                        current_method.clone(),
-                        format!("Found lowercase type '{}'. RBS requires 'String', 'Integer', 'Array', etc.", p)
-                    ));
-                    break; // Move to next line once one issue is found
+            for p in primitives {
+                let mut search_from = 0;
+                while let Some(rel) = line[search_from..].find(p) {
+                    let idx = search_from + rel;
+                    let after = idx + p.len();
+                    search_from = after;
+
+                    // Word boundaries: not part of a longer identifier
+                    // (e.g. "string_helper" should not match "string").
+                    let boundary_before = idx == 0
+                        || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
+                    let boundary_after = bytes
+                        .get(after)
+                        .is_none_or(|&c| !(c.is_ascii_alphanumeric() || c == b'_'));
+                    if !boundary_before || !boundary_after {
+                        continue;
+                    }
+
+                    // A lowercase word immediately followed by ':' is a
+                    // keyword-arg *name* (e.g. the `array` in `array: Array[String]`),
+                    // not a type — skip it.
+                    if bytes.get(after) == Some(&b':') {
+                        continue;
+                    }
+
+                    // Only flag where a type is actually expected: right after
+                    // `(`, `,`, `[`, `:`, or `->` (skipping intervening spaces).
+                    // This is what catches Sentinel's own named-positional-arg
+                    // style (`(string paramName, ...)`), not just the bracketed
+                    // and keyword-value forms the original patterns covered.
+                    let mut before = idx;
+                    while before > 0 && bytes[before - 1] == b' ' {
+                        before -= 1;
+                    }
+                    let in_type_position =
+                        before == 0 || matches!(bytes[before - 1], b'(' | b',' | b'[' | b':' | b'>');
+
+                    if in_type_position {
+                        issues.push((
+                            current_method.clone(),
+                            format!("Found lowercase type '{}'. RBS requires 'String', 'Integer', 'Array', etc.", p)
+                        ));
+                        break;
+                    }
                 }
             }
         }
         issues
+    }
+}
+
+#[cfg(test)]
+mod type_case_tests {
+    use super::*;
+
+    fn check(input: &str) -> Vec<(String, String)> {
+        TypeCasePlugin.check(input)
+    }
+
+    #[test]
+    fn catches_bare_single_arg() {
+        let issues = check("  def foo: (string) -> void");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].1.contains("string"));
+    }
+
+    #[test]
+    fn catches_keyword_arg_value() {
+        let issues = check("  def foo: (name: string) -> void");
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn catches_generic_arg() {
+        let issues = check("  def foo: () -> Array[string]");
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn catches_return_type() {
+        let issues = check("  def foo: () -> string");
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn catches_named_positional_arg_first() {
+        // Sentinel's own "Type paramName" positional-arg convention.
+        let issues = check("  def create_user: (string username, String password) -> bool");
+        assert_eq!(issues.len(), 1, "got: {:?}", issues);
+        assert!(issues[0].1.contains("string"));
+    }
+
+    #[test]
+    fn catches_named_positional_arg_after_comma() {
+        let issues = check("  def create_user: (String username, string password) -> bool");
+        assert_eq!(issues.len(), 1, "got: {:?}", issues);
+    }
+
+    #[test]
+    fn ignores_lowercase_keyword_arg_name() {
+        // `array` here is a keyword-arg *name*, not a type.
+        let issues = check("  def foo: (array: Array[String]) -> void");
+        assert!(issues.is_empty(), "got: {:?}", issues);
+    }
+
+    #[test]
+    fn ignores_correct_case() {
+        let issues = check("  def create_user: (String username, String password) -> bool");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_substring_identifiers() {
+        let issues = check("  def foo: (string_helper: String) -> void");
+        assert!(issues.is_empty(), "got: {:?}", issues);
+    }
+
+    #[test]
+    fn tracks_method_name() {
+        let issues = check("  def my_method: (string) -> void");
+        assert_eq!(issues[0].0, "my_method");
     }
 }

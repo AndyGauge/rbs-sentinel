@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`sentinel lsp`**: Sentinel now runs as its own Language Server (stdio, via `tower-lsp`). On `didOpen`/`didSave` it transpiles the file, writes the refreshed `.rbs` into `sig/generated` (same effect as `sentinel watch`), and publishes the annotation lint plugins' findings (void-argument, angle-bracket, type-case) as real `textDocument/publishDiagnostics`, anchored to the `#:` annotation line in the original `.rb` source — previously these only printed to whichever terminal was running `init`/`check`/`watch`. Runs alongside Steep (which still owns actual RBS type checking); see the README's Editor Setup section for Neovim/VS Code/Zed wiring.
+
+### Fixed
+- **`Type Case` plugin missed lowercase primitives in named-positional-arg style**: `TypeCasePlugin` only matched `(string)` (bare single arg), `: string`, `[string]`, and `-> string` — it had no pattern for Sentinel's own `(Type paramName, ...)` positional-arg convention (e.g. `(string username, String password)`), so a lowercase type there produced invalid RBS with no warning from `init`/`check`/`watch`/`lsp`. Rewrote the check to use type-position context (after `(`, `,`, `[`, `:`, or `->`, skipping a keyword-arg name like `array:`) instead of four literal patterns.
+
 ## [0.5.0] - 2026-07-31
 
 ### Added
