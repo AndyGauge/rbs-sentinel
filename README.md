@@ -1,13 +1,13 @@
-# 🛡️ Sentinel
+# 🛡️ RBS Sentinel
 
 RBS type signature generator for Rails — Rust-powered, CI-ready.
 
-**Sentinel** keeps your Ruby code and RBS type signatures in perfect sync. It bridges the gap between dynamic Ruby models and static RBS type definitions using a Rust transpiler for speed at scale.
+**RBS Sentinel** keeps your Ruby code and RBS type signatures in perfect sync. It bridges the gap between dynamic Ruby models and static RBS type definitions using a Rust transpiler for speed at scale.
 
 ## 🚀 Getting Started
 
 ### 1. Install the Gem
-Add Sentinel to your Gemfile:
+Add RBS Sentinel to your Gemfile:
 ```
     group :development do
       gem 'rbs-sentinel'
