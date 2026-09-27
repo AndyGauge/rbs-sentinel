@@ -1,0 +1,16 @@
+[book]
+title = "RBS Sentinel"
+description = "A Rust-powered watcher that keeps Ruby RBS type signatures in sync with inline annotations — and the editor feedback loop (Steep + a built-in LSP) that makes them useful."
+authors = ["Andrew Gauger"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/andygauge/rbs-sentinel"
+git-repository-icon = "fab-github"
+edit-url-template = "https://github.com/andygauge/rbs-sentinel/edit/master/book/{path}"
+site-url = "/rbs-sentinel/"
+
+[output.html.fold]
+enable = true
+level = 1

@@ -4,6 +4,8 @@ RBS type signature generator for Rails — Rust-powered, CI-ready.
 
 **RBS Sentinel** keeps your Ruby code and RBS type signatures in perfect sync. It bridges the gap between dynamic Ruby models and static RBS type definitions using a Rust transpiler for speed at scale.
 
+📖 **[Read the full docs](https://andygauge.github.io/rbs-sentinel/)** — what RBS and inline RBS are, adding Steep, and editor setup for Neovim, VS Code, and Zed.
+
 ## 🚀 Getting Started
 
 ### 1. Install the Gem
@@ -127,49 +129,55 @@ If the check fails, run `bundle exec sentinel init` to regenerate, review the ch
 
 ## 🛠️ Editor Setup
 
-To get live type-checking diagnostics, your editor needs to talk to Steep (the Ruby Type Server), which monitors the signatures Sentinel generates.
+Two things want to run against your Ruby files: **Sentinel** (annotation lint + `.rbs` generation) and **Steep** (real RBS type checking). They're separate concerns — Sentinel doesn't type-check, and Steep doesn't know how to read `#:` annotations — so both stay attached to your `.rb` files as two separate language servers.
 
-### Neovim Setup
-Add this to your LSP configuration (e.g., lsp.lua). This ensures Steep is aware of the file changes Sentinel makes in the background.
-```
-    require('lspconfig').steep.setup({
-      cmd = { "bundle", "exec", "steep", "langserver" },
-      capabilities = {
-        workspace = {
-          didChangeWatchedFiles = { dynamicRegistration = true },
-        },
-      },
-      settings = {
-        steep = {
-          check_on_save = true,
-          enable_diagnostics = true,
-        }
-      }
-    })
-```
-### VS Code Setup
-1. Install the Steep VS Code extension.
-2. Open your settings.json and ensure it points to your bundled Steep:
-```
-    {
-      "steep.command": "bundle exec steep langserver",
-      "steep.enableDiagnostics": true
+### Option A — `sentinel lsp` (recommended)
+
+Sentinel can run as its own Language Server: on `didOpen`/`didSave` it transpiles the file, writes the refreshed `.rbs` into `sig/generated` (same as `sentinel watch`), and publishes its lint plugin findings (void-argument, angle-bracket, type-case) straight into your editor via `textDocument/publishDiagnostics` — no more reading them off a terminal. It runs *alongside* Steep, not instead of it.
+
+#### Neovim
+```lua
+vim.lsp.config('sentinel', {
+  cmd = { 'bundle', 'exec', 'sentinel', 'lsp' },
+  filetypes = { 'ruby' },
+  root_markers = { '.sentinel.toml', 'Gemfile' },
+})
+vim.lsp.enable('sentinel')
+
+require('lspconfig').steep.setup({
+  cmd = { "bundle", "exec", "steep", "langserver" },
+  capabilities = {
+    workspace = {
+      didChangeWatchedFiles = { dynamicRegistration = true },
+    },
+  },
+  settings = {
+    steep = {
+      check_on_save = true,
+      enable_diagnostics = true,
     }
+  }
+})
 ```
-3. Sentinel runs as a separate process; VS Code will automatically pick up the generated .rbs files.
 
----
+#### VS Code
+1. Install the Steep VS Code extension as usual.
+2. Point a generic LSP client extension (or a thin wrapper extension) at `bundle exec sentinel lsp` for `ruby` files, alongside it.
+3. Sentinel's diagnostics are tagged `sentinel::<plugin name>` in the Problems panel, so they never get confused with Steep's type errors.
 
-## 🔄 How it Works
+#### Zed
+A ready-made extension lives in [`editors/zed/`](editors/zed) — it registers `sentinel lsp` as a second language server for Ruby files, alongside Zed's own Ruby support (and Steep, if you have a Steep extension configured). Install it as a dev extension:
 
-Sentinel is designed to be a "set-and-forget" background service:
+1. Command palette → **`zed: install dev extension`**.
+2. Select this repo's `editors/zed` directory (the one with `extension.toml`).
 
-1. The Watcher: You run 'bundle exec sentinel watch'. It stays active, monitoring your configured folders (default: app).
-2. The Transpiler: The moment you save a Ruby file, Sentinel's Rust engine generates a corresponding .rbs file in sig/generated.
-3. The Feedback: Your editor (via Steep) sees the new .rbs and immediately updates the diagnostics in your Ruby file.
+Zed builds and loads it immediately — no separate toolchain required. Full details, including how it locates the `sentinel` binary, are in the [Zed docs page](https://andygauge.github.io/rbs-sentinel/editor-feedback/zed.html).
 
----
-```
+### Option B — background job + Steep only
+
+If you'd rather not register a second language server, run `sentinel watch` as a detached background process kicked off from Steep's `on_attach` instead. This is the original wiring and still works fine — you just lose in-editor diagnostics for the lint plugins (they still print to the terminal running `watch`/`check`).
+
+```lua
 -- Add this to your lsp.lua, outside the return table or inside on_attach
 local function start_sentinel()
   if _G.sentinel_job_id then return end -- Don't start it twice
@@ -197,8 +205,22 @@ require('lspconfig').steep.setup({
     -- ... rest of your on_attach
   end,
   -- ... rest of your config
-})---
+})
 ```
+
+---
+
+## 🔄 How it Works
+
+Sentinel is designed to be a "set-and-forget" background service, in one of two shapes:
+
+1. **As an LSP** (`sentinel lsp`, recommended): your editor starts it like any other language server. On save, it transpiles the file, writes `sig/generated/*.rbs`, and publishes its own lint diagnostics directly into the buffer — Steep then picks up the refreshed `.rbs` and updates its type diagnostics the same way it always has.
+2. **As a background watcher** (`sentinel watch`): stays active, monitoring your configured folders (default: `app`) and regenerating `.rbs` files the moment you save, with lint issues printed to its own log instead of your editor.
+
+Either way, Steep is what turns the generated `.rbs` into live type-checking diagnostics — Sentinel's job is keeping those signatures current and (via `sentinel lsp`) catching annotation-shape mistakes before Steep ever sees them.
+
+---
+
 ## Feature Comparison
 
 Sentinel covers the full rbs-inline annotation surface and is ahead on two items from the [rbs-inline roadmap](https://github.com/soutaro/rbs-inline/wiki/Roadmap):

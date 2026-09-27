@@ -1,0 +1,12 @@
+[package]
+name = "sentinel-zed"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Zed extension: runs `sentinel lsp` alongside Ruby for RBS annotation-lint diagnostics"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"

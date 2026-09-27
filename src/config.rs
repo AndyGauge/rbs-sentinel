@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 const CONFIG_FILE: &str = ".sentinel.toml";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentinelConfig {
     pub folders: Vec<String>,
     pub output: String,

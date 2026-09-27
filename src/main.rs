@@ -1,6 +1,7 @@
 mod check;
 mod config;
 mod init;
+mod lsp;
 mod plugin;
 mod transpiler;
 mod watcher;
@@ -43,7 +44,7 @@ async fn main() -> Result<()> {
             for folder in config.folder_paths() {
                 init::run(&folder, &config.output_path(), &shared, config.emit_superclasses);
             }
-            let watcher = SentinelWatcher::new(&config)?.with_plugins();
+            let watcher = SentinelWatcher::new(&config)?;
             watcher.run().await;
         }
         "add" => {
@@ -80,9 +81,12 @@ async fn main() -> Result<()> {
             }
             println!("Output: {}", config.output);
         }
+        "lsp" => {
+            lsp::run().await;
+        }
         other => {
             eprintln!("Unknown command: {}", other);
-            eprintln!("Usage: sentinel [init|watch|check|add|remove|list]");
+            eprintln!("Usage: sentinel [init|watch|check|add|remove|list|lsp]");
             eprintln!();
             eprintln!("Commands:");
             eprintln!("  init           Generate RBS files for all watched folders");
@@ -91,6 +95,8 @@ async fn main() -> Result<()> {
             eprintln!("  add <folder>   Add a folder to the watch list");
             eprintln!("  remove <folder> Remove a folder from the watch list");
             eprintln!("  list           Show watched folders and output path");
+            eprintln!("  lsp            Run as a Language Server (stdio); publishes plugin");
+            eprintln!("                 diagnostics and syncs sig/generated on save");
             std::process::exit(1);
         }
     }
