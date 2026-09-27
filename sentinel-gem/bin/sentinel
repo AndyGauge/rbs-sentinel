@@ -21,7 +21,8 @@ arch = case cpu
          "x86_64"
        end
 
-binary_path = File.expand_path("../exe/sentinel-#{arch}-#{os}", __dir__)
+ext = os == "windows" ? ".exe" : ""
+binary_path = File.expand_path("../exe/sentinel-#{arch}-#{os}#{ext}", __dir__)
 
 if File.exist?(binary_path)
   # Forward all arguments from the ruby command to the Rust binary
