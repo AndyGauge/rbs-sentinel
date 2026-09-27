@@ -1,6 +1,6 @@
 # RBS Sentinel
 
-**RBS Sentinel** (the gem is `sentinel`, the binary is `sentinel-rb`) keeps your Ruby code and [RBS](./what-is-rbs.md) type signatures in sync automatically. You write a one-line type annotation directly above a method; Sentinel's Rust engine watches your files and regenerates the matching `.rbs` signature the moment you save — no header comment, no separate build step, no manually-maintained `.rbs` tree that silently drifts out of date.
+**RBS Sentinel** (the gem is `rbs-sentinel`, the command you run is `sentinel`) keeps your Ruby code and [RBS](./what-is-rbs.md) type signatures in sync automatically. You write a one-line type annotation directly above a method; Sentinel's Rust engine watches your files and regenerates the matching `.rbs` signature the moment you save — no header comment, no separate build step, no manually-maintained `.rbs` tree that silently drifts out of date.
 
 It exists to answer one complaint about adding static types to a Ruby codebase: keeping the `.rbs` files honest is tedious enough that most teams stop doing it. Sentinel makes the generation step fast enough and automatic enough that it disappears.
 
