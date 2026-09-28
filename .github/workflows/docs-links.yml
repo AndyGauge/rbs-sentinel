@@ -1,0 +1,26 @@
+name: Check docs links
+
+on:
+  pull_request:
+    paths:
+      - "book/**"
+      - "lychee.toml"
+      - ".github/workflows/docs-links.yml"
+  push:
+    branches: [master]
+    paths:
+      - "book/**"
+      - "lychee.toml"
+  workflow_dispatch:
+
+jobs:
+  lychee:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Link Checker
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress --config lychee.toml 'book/src/**/*.md'
+          fail: true

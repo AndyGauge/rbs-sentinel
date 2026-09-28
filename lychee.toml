@@ -1,0 +1,13 @@
+# Config for lychee (https://github.com/lycheeverse/lychee), run in CI
+# against book/src/**/*.md — see .github/workflows/docs-links.yml
+
+timeout = 20
+max_retries = 3
+retry_wait_time = 2
+
+exclude = [
+  # npmjs.com's bot/DDoS protection returns 403 to any non-browser client
+  # regardless of User-Agent — verified with a browser UA via curl, still
+  # 403. Not an actual broken link, just unreachable by an automated checker.
+  "^https://www\\.npmjs\\.com/",
+]
