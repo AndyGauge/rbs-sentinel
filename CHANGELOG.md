@@ -4,7 +4,7 @@
 
 ### Added
 - **More inline RBS forms** (#33): trailing `attr_reader :a #: String`, `# @rbs @ivar: T`, `# @rbs x: T` / `# @rbs return: T` (signature built from the def's parameters; untagged ones are `untyped`), and `# @rbs (Integer) -> String`.
-- **Warnings for annotations that can't be transpiled**: dangling `#:`/`@rbs` tags, unsupported `@rbs` tags and malformed signatures are reported on stderr by `init` with their line number.
+- **Warnings for annotations that can't be transpiled**: dangling `#:`/`@rbs` tags, unsupported `@rbs` tags and malformed signatures are reported with their line number: on stderr by `init`/`check`/`watch`, and as `sentinel::annotations` warning diagnostics by `sentinel lsp`.
 
 ### Fixed
 - A trailing `#: T` after `attr_*` leaked onto the next `attr_*` line, giving it the wrong type.

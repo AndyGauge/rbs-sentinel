@@ -34,6 +34,14 @@ struct ClassInfo {
     warnings: Vec<String>,
 }
 
+/// An annotation that was recognised but not turned into RBS.
+#[derive(Debug, Clone)]
+pub struct Warning {
+    /// 1-based source line.
+    pub line: usize,
+    pub message: String,
+}
+
 pub struct SentinelTranspiler {
     parser: Parser,
     shared_paths: Vec<std::path::PathBuf>,
@@ -60,8 +68,18 @@ impl SentinelTranspiler {
     /// Warnings from the last `transpile_file` call: annotations that were
     /// recognised but could not be turned into RBS (dangling, malformed or
     /// unsupported). Each is prefixed with its source line.
-    pub fn take_warnings(&mut self) -> Vec<String> {
+    pub fn take_warnings(&mut self) -> Vec<Warning> {
         std::mem::take(&mut self.warnings)
+            .into_iter()
+            .map(|w| {
+                // Internal warnings are recorded as "line N: message".
+                let parsed = w.strip_prefix("line ").and_then(|r| r.split_once(": "));
+                match parsed.and_then(|(n, m)| Some((n.parse::<usize>().ok()?, m))) {
+                    Some((line, message)) => Warning { line, message: message.to_string() },
+                    None => Warning { line: 1, message: w },
+                }
+            })
+            .collect()
     }
 
     /// Set the directories to search for shared `.rbs` type files (used by `# @rbs import`).
@@ -2727,7 +2745,7 @@ end
         fs::write(&path, src).unwrap();
         let mut t = SentinelTranspiler::new();
         let out = t.transpile_file(&path).unwrap();
-        (out, t.take_warnings())
+        (out, t.take_warnings().into_iter().map(|w| w.message).collect())
     }
 
     #[test]
@@ -2782,5 +2800,16 @@ end
         assert!(w.iter().any(|m| m.contains("malformed signature for `bad`")), "{:?}", w);
         assert!(w.iter().any(|m| m.contains("`@rbs x` is not attached")), "{:?}", w);
         assert!(w.iter().any(|m| m.contains("unsupported annotation")), "{:?}", w);
+    }
+
+    #[test]
+    fn test_warnings_carry_line_numbers() {
+        let path = std::env::temp_dir().join("sentinel_warn_line.rb");
+        fs::write(&path, "class A\n  # @rbs x: Integer\n  FOO = 1\nend\n").unwrap();
+        let mut t = SentinelTranspiler::new();
+        t.transpile_file(&path).unwrap();
+        let w = t.take_warnings();
+        assert_eq!(w.len(), 1, "{:?}", w);
+        assert_eq!(w[0].line, 2);
     }
 }

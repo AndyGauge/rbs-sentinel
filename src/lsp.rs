@@ -18,7 +18,7 @@
 use crate::config::SentinelConfig;
 use crate::init::derive_sig_path;
 use crate::plugin::Plugin;
-use crate::transpiler::SentinelTranspiler;
+use crate::transpiler::{SentinelTranspiler, Warning};
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result as RpcResult;
@@ -142,7 +142,7 @@ impl Backend {
         let emit_superclasses = config.emit_superclasses;
 
         let blocking_path = path.clone();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, Vec<Warning>)> {
             let mut transpiler = SentinelTranspiler::new();
             transpiler.set_shared_paths(shared);
             transpiler.set_emit_superclasses(emit_superclasses);
@@ -160,12 +160,12 @@ impl Backend {
                 }
                 std::fs::write(&target, &rbs)?;
             }
-            Ok(rbs)
+            Ok((rbs, transpiler.take_warnings()))
         })
         .await;
 
-        let rbs_content = match result {
-            Ok(Ok(content)) => content,
+        let (rbs_content, warnings) = match result {
+            Ok(Ok(out)) => out,
             Ok(Err(e)) => {
                 self.publish_error(&uri, format!("{:#}", e)).await;
                 return;
@@ -192,6 +192,18 @@ impl Backend {
                     ..Diagnostic::default()
                 });
             }
+        }
+
+        // Annotations Sentinel saw but couldn't transpile (dangling, malformed, unsupported).
+        for w in warnings {
+            let line = w.line.saturating_sub(1);
+            diagnostics.push(Diagnostic {
+                range: Self::line_range(&source_lines, line),
+                severity: Some(DiagnosticSeverity::WARNING),
+                source: Some("sentinel::annotations".to_string()),
+                message: w.message,
+                ..Diagnostic::default()
+            });
         }
 
         self.client.publish_diagnostics(uri, diagnostics, None).await;

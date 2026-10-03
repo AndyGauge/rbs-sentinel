@@ -40,7 +40,7 @@ pub fn run(app_path: &Path, output_path: &Path, shared_paths: &[PathBuf], emit_s
 
         let result = transpiler.transpile_file(path);
         for w in transpiler.take_warnings() {
-            eprintln!("  [warn] {}: {}", path.display(), w);
+            eprintln!("  [warn] {}:{}: {}", path.display(), w.line, w.message);
         }
         match result {
             Ok(rbs_content) => {

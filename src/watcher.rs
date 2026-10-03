@@ -110,7 +110,11 @@ impl SentinelWatcher {
             path.file_name().unwrap_or_default()
         );
 
-        match transpiler.transpile_file(path) {
+        let result = transpiler.transpile_file(path);
+        for w in transpiler.take_warnings() {
+            eprintln!("⚠️  [warn] {}:{}: {}", path.display(), w.line, w.message);
+        }
+        match result {
             Ok(rbs_content) => {
                 // 1. RUN PLUGINS (The new linter system)
                 for plugin in Plugin::ALL {
