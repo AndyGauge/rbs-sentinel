@@ -38,7 +38,11 @@ pub fn run(app_path: &Path, output_path: &Path, shared_paths: &[PathBuf], emit_s
         transpiler.set_emit_superclasses(emit_superclasses);
         transpiler.set_shared_paths(shared_paths.to_vec());
 
-        match transpiler.transpile_file(path) {
+        let result = transpiler.transpile_file(path);
+        for w in transpiler.take_warnings() {
+            eprintln!("  [warn] {}: {}", path.display(), w);
+        }
+        match result {
             Ok(rbs_content) => {
                 if !SentinelTranspiler::has_content(&rbs_content) {
                     skipped.fetch_add(1, Ordering::Relaxed);

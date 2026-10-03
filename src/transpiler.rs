@@ -27,13 +27,18 @@ struct ClassInfo {
     self_methods: Vec<(String, String)>,
     type_aliases: Vec<String>,
     attributes: Vec<(String, String, String)>, // (attr_kind, attr_name, type)
+    /// `# @rbs @name: Type` instance variable declarations, as (name, type).
+    ivars: Vec<(String, String)>,
     sub_modules: Vec<SubModuleInfo>,
+    /// Annotations that were recognised but could not be transpiled.
+    warnings: Vec<String>,
 }
 
 pub struct SentinelTranspiler {
     parser: Parser,
     shared_paths: Vec<std::path::PathBuf>,
     emit_superclasses: bool,
+    warnings: Vec<String>,
 }
 
 impl SentinelTranspiler {
@@ -48,7 +53,15 @@ impl SentinelTranspiler {
             parser,
             shared_paths: Vec::new(),
             emit_superclasses: false,
+            warnings: Vec::new(),
         }
+    }
+
+    /// Warnings from the last `transpile_file` call: annotations that were
+    /// recognised but could not be turned into RBS (dangling, malformed or
+    /// unsupported). Each is prefixed with its source line.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     /// Set the directories to search for shared `.rbs` type files (used by `# @rbs import`).
@@ -389,7 +402,9 @@ impl SentinelTranspiler {
             self_methods: Vec::new(),
             type_aliases: Vec::new(),
             attributes: Vec::new(),
+            ivars: Vec::new(),
             sub_modules: Vec::new(),
+            warnings: Vec::new(),
         };
         Self::walk(source, root, &mut module_stack, &mut info, shared_paths);
         info
@@ -412,6 +427,117 @@ impl SentinelTranspiler {
         result
     }
 
+    /// Strip a trailing ` -- description` from an `@rbs` tag value.
+    fn tag_type(s: &str) -> String {
+        match s.find(" -- ") {
+            Some(i) => s[..i].trim().to_string(),
+            None => s.trim().to_string(),
+        }
+    }
+
+    /// Build a method signature from `# @rbs name: Type` / `# @rbs return: Type`
+    /// tags and the method's actual parameter list. Parameters without a tag are
+    /// `untyped`, as is the return type when there's no `return` tag.
+    fn sig_from_tags(
+        source: &str,
+        method: Node,
+        tags: &[(usize, String, String)],
+    ) -> String {
+        let lookup = |name: &str| -> String {
+            tags.iter()
+                .rev()
+                .find(|(_, n, _)| n == name)
+                .map(|(_, _, t)| t.clone())
+                .unwrap_or_else(|| "untyped".to_string())
+        };
+        let mut params: Vec<String> = Vec::new();
+        if let Some(plist) = method.child_by_field_name("parameters") {
+            let mut cursor = plist.walk();
+            for p in plist.children(&mut cursor) {
+                let name_of = |n: Option<Node>| {
+                    n.map(|n| Self::node_text(source, &n).to_string())
+                };
+                match p.kind() {
+                    "identifier" => {
+                        let n = Self::node_text(source, &p);
+                        params.push(format!("{} {}", lookup(n), n));
+                    }
+                    "optional_parameter" => {
+                        if let Some(n) = name_of(p.child_by_field_name("name")) {
+                            params.push(format!("?{} {}", lookup(&n), n));
+                        }
+                    }
+                    "keyword_parameter" => {
+                        if let Some(n) = name_of(p.child_by_field_name("name")) {
+                            let optional = if p.child_by_field_name("value").is_some() {
+                                "?"
+                            } else {
+                                ""
+                            };
+                            params.push(format!("{}{}: {}", optional, n, lookup(&n)));
+                        }
+                    }
+                    "splat_parameter" => match name_of(p.child_by_field_name("name")) {
+                        Some(n) => params.push(format!("*{} {}", lookup(&n), n)),
+                        None => params.push("*untyped".to_string()),
+                    },
+                    "hash_splat_parameter" => {
+                        match name_of(p.child_by_field_name("name")) {
+                            Some(n) => params.push(format!("**{} {}", lookup(&n), n)),
+                            None => params.push("**untyped".to_string()),
+                        }
+                    }
+                    "block_parameter" => {
+                        if let Some(n) = name_of(p.child_by_field_name("name")) {
+                            // Block tags are written as a full block type, e.g.
+                            // `# @rbs &block: (String) -> void`.
+                            let t = lookup(&n);
+                            if t == "untyped" {
+                                params.push("?{ (*untyped) -> untyped }".to_string());
+                            } else {
+                                params.push(format!("{{ {} }}", t));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Block parameters belong after the closing paren in RBS.
+        let (block, positional): (Vec<String>, Vec<String>) = params
+            .into_iter()
+            .partition(|p| p.starts_with("?{") || p.starts_with('{'));
+        let mut sig = format!("({})", positional.join(", "));
+        if let Some(b) = block.first() {
+            sig.push(' ');
+            sig.push_str(b);
+        }
+        sig.push_str(" -> ");
+        sig.push_str(&lookup("return"));
+        sig
+    }
+
+    /// Record a warning for annotations that were seen but not turned into RBS.
+    fn warn_dropped(
+        info: &mut ClassInfo,
+        ann: &mut Option<String>,
+        ann_line: usize,
+        tags: &mut Vec<(usize, String, String)>,
+    ) {
+        if let Some(a) = ann.take() {
+            info.warnings.push(format!(
+                "line {}: signature `{}` is not attached to a method or attribute",
+                ann_line, a
+            ));
+        }
+        for (line, name, _) in tags.drain(..) {
+            info.warnings.push(format!(
+                "line {}: `@rbs {}` is not attached to a method",
+                line, name
+            ));
+        }
+    }
+
     /// Scan a sequence of sibling nodes for annotated methods, type aliases, and attributes
     fn scan_body(
         source: &str,
@@ -421,9 +547,20 @@ impl SentinelTranspiler {
         shared_paths: &[std::path::PathBuf],
     ) {
         let mut pending_annotation: Option<String> = None;
+        let mut pending_ann_line = 0usize;
+        // `# @rbs name: Type` / `# @rbs return: Type` as (line, name, type)
+        let mut pending_tags: Vec<(usize, String, String)> = Vec::new();
         let mut pending_type_alias: Option<String> = None;
+        // End row of the previous non-comment sibling, to spot trailing comments.
+        let mut prev_end_row: Option<usize> = None;
 
-        for &child in children {
+        for (idx, &child) in children.iter().enumerate() {
+            // A comment on the same line as the previous statement trails it
+            // (`attr_reader :a #: String`); it never annotates what follows.
+            if child.kind() == "comment" && prev_end_row == Some(child.start_position().row) {
+                continue;
+            }
+
             // Finalize pending type alias if this node doesn't continue it
             if pending_type_alias.is_some() {
                 let continues = child.kind() == "comment" && {
@@ -452,6 +589,11 @@ impl SentinelTranspiler {
                         info.type_aliases.push(format!("type {}", alias));
                     }
                 }
+            }
+
+            let line = child.start_position().row + 1;
+            if child.kind() != "comment" {
+                prev_end_row = Some(child.end_position().row);
             }
 
             match child.kind() {
@@ -491,22 +633,84 @@ impl SentinelTranspiler {
                             } else {
                                 // Previous annotation was complete; start fresh
                                 pending_annotation = Some(trimmed.to_string());
+                                pending_ann_line = line;
                             }
                         } else {
                             pending_annotation = Some(trimmed.to_string());
+                            pending_ann_line = line;
+                        }
+                    } else if let Some(rest) = text.strip_prefix("# @rbs ") {
+                        let rest = rest.trim();
+                        if rest.starts_with('(') {
+                            // `# @rbs (Integer) -> String` is the same as `#: ...`
+                            pending_annotation = Some(Self::tag_type(rest));
+                            pending_ann_line = line;
+                        } else if let Some(ivar) = rest.strip_prefix('@') {
+                            match ivar.split_once(':') {
+                                Some((name, ty)) if !ty.trim().is_empty() => {
+                                    let ty = Self::tag_type(ty);
+                                    if Self::is_balanced(&ty) {
+                                        let name = format!("@{}", name.trim());
+                                        info.ivars.push((
+                                            if singleton_context {
+                                                format!("self.{}", name)
+                                            } else {
+                                                name
+                                            },
+                                            ty,
+                                        ));
+                                    } else {
+                                        info.warnings.push(format!(
+                                            "line {}: malformed type in `{}`",
+                                            line, rest
+                                        ));
+                                    }
+                                }
+                                _ => info.warnings.push(format!(
+                                    "line {}: could not parse `@rbs @{}`",
+                                    line, ivar
+                                )),
+                            }
+                        } else if let Some((name, ty)) = rest.split_once(':').filter(|(n, _)| {
+                            let n = n.trim().trim_start_matches(['*', '&']);
+                            !n.is_empty()
+                                && n.chars().all(|c| c.is_alphanumeric() || c == '_')
+                        }) {
+                            let name = name.trim().trim_start_matches(['*', '&']).to_string();
+                            pending_tags.push((line, name, Self::tag_type(ty)));
+                        } else {
+                            info.warnings.push(format!(
+                                "line {}: unsupported annotation `# @rbs {}`",
+                                line, rest
+                            ));
                         }
                     } else {
+                        // Plain comment: tags may be separated from the def by prose,
+                        // but a stray `#:` signature may not.
                         pending_annotation = None;
                     }
                 }
                 "method" => {
                     pending_type_alias = None;
-                    if let Some(sig) = pending_annotation.take() {
+                    let sig = match pending_annotation.take() {
+                        Some(s) => Some(s),
+                        None if !pending_tags.is_empty() => {
+                            Some(Self::sig_from_tags(source, child, &pending_tags))
+                        }
+                        None => None,
+                    };
+                    pending_tags.clear();
+                    if let Some(sig) = sig {
                         if let Some(name_node) = child.child_by_field_name("name") {
                             let method_name =
                                 Self::node_text(source, &name_node).to_string();
                             let sig = Self::strip_annotations(&sig);
-                            if singleton_context {
+                            if !Self::is_balanced(&sig) || sig.ends_with('(') {
+                                info.warnings.push(format!(
+                                    "line {}: malformed signature for `{}`: {}",
+                                    line, method_name, sig
+                                ));
+                            } else if singleton_context {
                                 info.self_methods.push((method_name, sig));
                             } else {
                                 info.methods.push((method_name, sig));
@@ -516,12 +720,27 @@ impl SentinelTranspiler {
                 }
                 "singleton_method" => {
                     pending_type_alias = None;
-                    if let Some(sig) = pending_annotation.take() {
+                    let sig = match pending_annotation.take() {
+                        Some(s) => Some(s),
+                        None if !pending_tags.is_empty() => {
+                            Some(Self::sig_from_tags(source, child, &pending_tags))
+                        }
+                        None => None,
+                    };
+                    pending_tags.clear();
+                    if let Some(sig) = sig {
                         if let Some(name_node) = child.child_by_field_name("name") {
                             let method_name =
                                 Self::node_text(source, &name_node).to_string();
                             let sig = Self::strip_annotations(&sig);
-                            info.self_methods.push((method_name, sig));
+                            if !Self::is_balanced(&sig) || sig.ends_with('(') {
+                                info.warnings.push(format!(
+                                    "line {}: malformed signature for `{}`: {}",
+                                    line, method_name, sig
+                                ));
+                            } else {
+                                info.self_methods.push((method_name, sig));
+                            }
                         }
                     }
                 }
@@ -529,11 +748,12 @@ impl SentinelTranspiler {
                     // class << self — methods inside are class methods
                     let inner_children = Self::flatten_children(child);
                     Self::scan_body(source, &inner_children, info, true, shared_paths);
-                    pending_annotation = None;
+                    Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
                     pending_type_alias = None;
                 }
                 "call" => {
                     pending_type_alias = None;
+                    let mut handled = false;
                     // Check for attr_reader, attr_writer, attr_accessor
                     if let Some(method_node) = child.child_by_field_name("method") {
                         let method_name = Self::node_text(source, &method_node);
@@ -541,9 +761,23 @@ impl SentinelTranspiler {
                             method_name,
                             "attr_reader" | "attr_writer" | "attr_accessor"
                         ) {
-                            if let Some(type_sig) = pending_annotation.take() {
+                            handled = true;
+                            // Either a leading `#: T` or a trailing `attr_x :a #: T`.
+                            let trailing = children.get(idx + 1).and_then(|n| {
+                                (n.kind() == "comment"
+                                    && n.start_position().row == child.end_position().row)
+                                    .then(|| Self::node_text(source, n))
+                                    .and_then(|t| t.strip_prefix("#: "))
+                                    .map(|t| t.trim().to_string())
+                            });
+                            if let Some(type_sig) = pending_annotation.take().or(trailing) {
                                 let type_sig = Self::strip_annotations(&type_sig);
-                                if let Some(args_node) =
+                                if !Self::is_balanced(&type_sig) {
+                                    info.warnings.push(format!(
+                                        "line {}: malformed type for `{}`: {}",
+                                        line, method_name, type_sig
+                                    ));
+                                } else if let Some(args_node) =
                                     child.child_by_field_name("arguments")
                                 {
                                     let mut args_cursor = args_node.walk();
@@ -562,21 +796,23 @@ impl SentinelTranspiler {
                                     }
                                 }
                             }
-                        } else {
-                            pending_annotation = None;
+                            Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
                         }
-                    } else {
-                        pending_annotation = None;
+                    }
+                    if !handled {
+                        Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
                     }
                 }
                 _ => {
                     if child.kind() != "superclass" {
-                        pending_annotation = None;
+                        Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
                         pending_type_alias = None;
                     }
                 }
             }
         }
+
+        Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
 
         // Finalize any remaining pending type alias
         if let Some(alias) = pending_type_alias {
@@ -672,10 +908,13 @@ impl SentinelTranspiler {
                             self_methods: Vec::new(),
                             type_aliases: Vec::new(),
                             attributes: Vec::new(),
+                            ivars: Vec::new(),
                             sub_modules: Vec::new(),
+                            warnings: Vec::new(),
                         };
                         let children = Self::flatten_children(node);
                         Self::scan_body(source, &children, &mut parent_info, false, shared_paths);
+                        info.warnings.append(&mut parent_info.warnings);
                         if !parent_info.methods.is_empty()
                             || !parent_info.self_methods.is_empty()
                             || !parent_info.type_aliases.is_empty()
@@ -731,6 +970,7 @@ impl SentinelTranspiler {
                 info.self_methods.clear();
                 info.type_aliases.clear();
                 info.attributes.clear();
+                info.ivars.clear();
 
                 // Flatten direct children + body_statement children, then scan
                 let children = Self::flatten_children(node);
@@ -749,7 +989,10 @@ impl SentinelTranspiler {
 
     /// Returns true if the generated RBS has meaningful content worth writing
     pub fn has_content(rbs: &str) -> bool {
-        rbs.contains("def ") || rbs.contains("type ") || rbs.contains("attr_")
+        rbs.contains("def ")
+            || rbs.contains("type ")
+            || rbs.contains("attr_")
+            || rbs.lines().any(|l| l.trim_start().starts_with('@') || l.trim_start().starts_with("self.@"))
     }
 
     /// Split `s` at top-level commas (ignoring commas nested inside `{}`, `()`, `[]`).
@@ -880,6 +1123,7 @@ impl SentinelTranspiler {
         let tree = self.parser.parse(&source, None).ok_or("Failed to parse")?;
 
         let info = Self::collect_structure(&source, tree.root_node(), &self.shared_paths);
+        self.warnings = info.warnings.clone();
 
         let mut rbs_output = String::new();
         rbs_output.push_str("# Generated by Sentinel - Do not edit manually\n\n");
@@ -930,6 +1174,11 @@ impl SentinelTranspiler {
                 "{}{} {}: {}\n",
                 member_indent, kind, name, type_sig
             ));
+        }
+
+        // Instance variables
+        for (name, ty) in &info.ivars {
+            rbs_output.push_str(&format!("{}{}: {}\n", member_indent, name, ty));
         }
 
         // Class methods
@@ -2472,4 +2721,66 @@ end
         assert!(with.contains("class User < ApplicationRecord\n"), "Got: {}", with);
     }
 
+
+    fn transpile_str(name: &str, src: &str) -> (String, Vec<String>) {
+        let path = std::env::temp_dir().join(name);
+        fs::write(&path, src).unwrap();
+        let mut t = SentinelTranspiler::new();
+        let out = t.transpile_file(&path).unwrap();
+        (out, t.take_warnings())
+    }
+
+    #[test]
+    fn test_trailing_attr_annotations_do_not_leak() {
+        let (out, w) = transpile_str(
+            "sentinel_trailing_attr.rb",
+            "class A\n  attr_reader :a #: String\n  attr_accessor :b #: Integer?\nend\n",
+        );
+        assert!(out.contains("attr_reader a: String"), "Got: {}", out);
+        assert!(out.contains("attr_accessor b: Integer?"), "Got: {}", out);
+        assert!(w.is_empty(), "{:?}", w);
+    }
+
+    #[test]
+    fn test_rbs_ivar_tag() {
+        let (out, _) = transpile_str(
+            "sentinel_ivar.rb",
+            "class A\n  # @rbs @c: String\n  #: () -> void\n  def f; end\nend\n",
+        );
+        assert!(out.contains("  @c: String\n"), "Got: {}", out);
+    }
+
+    #[test]
+    fn test_rbs_param_and_return_tags() {
+        let (out, _) = transpile_str(
+            "sentinel_tags.rb",
+            "class A\n  # @rbs x: Integer\n  # @rbs *rest: String\n  # @rbs k: Symbol -- desc\n  # @rbs return: String\n  def f(x, *rest, k:); end\n\n  # @rbs x: Integer\n  def g(x); end\nend\n",
+        );
+        assert!(
+            out.contains("def f: (Integer x, *String rest, k: Symbol) -> String"),
+            "Got: {}", out
+        );
+        assert!(out.contains("def g: (Integer x) -> untyped"), "Got: {}", out);
+    }
+
+    #[test]
+    fn test_rbs_inline_signature_tag() {
+        let (out, _) = transpile_str(
+            "sentinel_sigtag.rb",
+            "class A\n  # @rbs (Integer) -> String\n  def f(x); end\nend\n",
+        );
+        assert!(out.contains("def f: (Integer) -> String"), "Got: {}", out);
+    }
+
+    #[test]
+    fn test_dangling_and_malformed_annotations_warn() {
+        let (out, w) = transpile_str(
+            "sentinel_warn.rb",
+            "class A\n  #: (Integer) -> oops(\n  def bad(x); end\n\n  # @rbs x: Integer\n  FOO = 1\n\n  # @rbs skip\nend\n",
+        );
+        assert!(!out.contains("oops"), "Got: {}", out);
+        assert!(w.iter().any(|m| m.contains("malformed signature for `bad`")), "{:?}", w);
+        assert!(w.iter().any(|m| m.contains("`@rbs x` is not attached")), "{:?}", w);
+        assert!(w.iter().any(|m| m.contains("unsupported annotation")), "{:?}", w);
+    }
 }
