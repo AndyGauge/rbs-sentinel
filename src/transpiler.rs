@@ -7,32 +7,67 @@ use tree_sitter::{Node, Parser};
 /// are emitted on multiple lines in the generated `.rbs` output.
 const MULTILINE_THRESHOLD: usize = 3;
 
-struct SubModuleInfo {
+/// One `class` or `module` in the source: its annotated members, plus the classes
+/// and modules nested inside it. A file is a list of these, so everything in it can
+/// be emitted, not just one scope.
+struct Scope {
+    /// Name as written, e.g. `Foo` or `Foo::Bar`.
     name: String,
-    methods: Vec<(String, String)>,
-    self_methods: Vec<(String, String)>,
-    type_aliases: Vec<String>,
-    attributes: Vec<(String, String, String)>,
-}
-
-struct ClassInfo {
-    modules: Vec<String>,
-    class_name: String,
+    is_module: bool,
     /// Superclass constant path as written in source, e.g. `Tool::WorkflowBase`.
     /// `None` for modules, for classes with no explicit parent, and for parents
     /// that are not a plain constant path (`Struct.new(:a)`, `Class.new`, ...),
     /// which cannot be expressed as an RBS superclass.
     superclass: Option<String>,
-    is_module: bool,
     methods: Vec<(String, String)>,
     self_methods: Vec<(String, String)>,
     type_aliases: Vec<String>,
     attributes: Vec<(String, String, String)>, // (attr_kind, attr_name, type)
     /// `# @rbs @name: Type` instance variable declarations, as (name, type).
     ivars: Vec<(String, String)>,
-    sub_modules: Vec<SubModuleInfo>,
+    /// Classes and modules nested inside this one, in source order.
+    children: Vec<Scope>,
     /// Annotations that were recognised but could not be transpiled.
     warnings: Vec<String>,
+}
+
+impl Scope {
+    fn new(name: String, is_module: bool) -> Self {
+        Scope {
+            name,
+            is_module,
+            superclass: None,
+            methods: Vec::new(),
+            self_methods: Vec::new(),
+            type_aliases: Vec::new(),
+            attributes: Vec::new(),
+            ivars: Vec::new(),
+            children: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// True if this scope itself declares anything (not counting nested scopes).
+    fn has_members(&self) -> bool {
+        !(self.methods.is_empty()
+            && self.self_methods.is_empty()
+            && self.type_aliases.is_empty()
+            && self.attributes.is_empty()
+            && self.ivars.is_empty())
+    }
+
+    /// True if this scope or anything nested in it declares something worth emitting.
+    fn has_output(&self) -> bool {
+        self.has_members() || self.children.iter().any(Scope::has_output)
+    }
+
+    /// All warnings in this scope and below.
+    fn all_warnings(&self, out: &mut Vec<String>) {
+        out.extend(self.warnings.iter().cloned());
+        for c in &self.children {
+            c.all_warnings(out);
+        }
+    }
 }
 
 /// An annotation that was recognised but not turned into RBS.
@@ -409,24 +444,12 @@ impl SentinelTranspiler {
         stack.is_empty()
     }
 
-    /// Collect structure from the AST: module nesting, class name, and annotated methods.
-    fn collect_structure(source: &str, root: Node, shared_paths: &[std::path::PathBuf]) -> ClassInfo {
-        let mut module_stack = Vec::new();
-        let mut info = ClassInfo {
-            modules: Vec::new(),
-            class_name: "UnknownClass".to_string(),
-            superclass: None,
-            is_module: false,
-            methods: Vec::new(),
-            self_methods: Vec::new(),
-            type_aliases: Vec::new(),
-            attributes: Vec::new(),
-            ivars: Vec::new(),
-            sub_modules: Vec::new(),
-            warnings: Vec::new(),
-        };
-        Self::walk(source, root, &mut module_stack, &mut info, shared_paths);
-        info
+    /// Collect the file's classes and modules (each with its annotated members and
+    /// nested scopes) from the AST.
+    fn collect_structure(source: &str, root: Node, shared_paths: &[std::path::PathBuf]) -> Vec<Scope> {
+        let mut scopes = Vec::new();
+        Self::walk(source, root, &mut scopes, shared_paths);
+        scopes
     }
 
     /// Flatten a node's children, inlining body_statement children
@@ -434,7 +457,7 @@ impl SentinelTranspiler {
         let mut result = Vec::new();
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() == "body_statement" {
+            if matches!(child.kind(), "body_statement" | "block_body") {
                 let mut bs_cursor = child.walk();
                 for bs_child in child.children(&mut bs_cursor) {
                     result.push(bs_child);
@@ -444,6 +467,107 @@ impl SentinelTranspiler {
             }
         }
         result
+    }
+
+    /// Flatten the body of an `if`/`unless`/`case`/`begin` into one sequence of
+    /// statements, so `scan_body` can pair each `#:` comment with its `def`.
+    ///
+    /// The branch nodes (`then`, `else`, `elsif`, `when`, ...) are inlined, because
+    /// tree-sitter attaches a comment that precedes the first statement of a branch to
+    /// the enclosing node rather than to the branch.
+    fn flatten_control<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+        let mut out = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if !child.is_named() {
+                continue; // `if`, `else`, `end`, ... keyword tokens
+            }
+            match child.kind() {
+                "then" | "else" | "elsif" | "when" | "ensure" | "rescue" | "body_statement" => {
+                    out.extend(Self::flatten_control(child))
+                }
+                _ => out.push(child),
+            }
+        }
+        out
+    }
+
+    /// The `def` wrapped by `private def foo`, `module_function def foo` or
+    /// `private_class_method def self.foo`, if `call` is one of those.
+    fn wrapped_def<'a>(call: Node<'a>, method_name: &str) -> Option<Node<'a>> {
+        if !matches!(
+            method_name,
+            "private" | "protected" | "public" | "module_function" | "private_class_method" | "public_class_method"
+        ) {
+            return None;
+        }
+        let args = call.child_by_field_name("arguments")?;
+        let mut cursor = args.walk();
+        args.children(&mut cursor)
+            .find(|c| matches!(c.kind(), "method" | "singleton_method"))
+    }
+
+    /// Record the annotation pending on a method definition, if there is one.
+    /// `to_self` puts it with the class methods (`def self.x`, or inside `class << self`).
+    fn record_method(
+        source: &str,
+        def: Node,
+        info: &mut Scope,
+        to_self: bool,
+        pending_annotation: &mut Option<String>,
+        pending_tags: &mut Vec<(usize, String, String)>,
+        line: usize,
+    ) {
+        let sig = match pending_annotation.take() {
+            Some(s) => Some(s),
+            None if !pending_tags.is_empty() => Some(Self::sig_from_tags(source, def, pending_tags)),
+            None => None,
+        };
+        pending_tags.clear();
+        let Some(sig) = sig else { return };
+        let Some(name_node) = def.child_by_field_name("name") else { return };
+        let method_name = Self::node_text(source, &name_node).to_string();
+        let sig = Self::strip_annotations(&sig);
+        if !Self::is_balanced(&sig) || sig.ends_with('(') {
+            info.warnings
+                .push(format!("line {}: malformed signature for `{}`: {}", line, method_name, sig));
+        } else if to_self {
+            info.self_methods.push((method_name, sig));
+        } else {
+            info.methods.push((method_name, sig));
+        }
+    }
+
+    /// A block attached to a call in a class body. `class_methods do` (ActiveSupport::
+    /// Concern) declares class methods, so its defs are scanned as such. Any other block
+    /// (`included do`, `Struct.new do`, ...) runs in a different context from the class
+    /// body, so annotated members inside it are not emitted; say so instead of dropping
+    /// them silently.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_block(
+        source: &str,
+        call: Node,
+        block: Node,
+        method_name: &str,
+        info: &mut Scope,
+        line: usize,
+        shared_paths: &[std::path::PathBuf],
+    ) {
+        let inner = Self::flatten_children(block);
+        if method_name == "class_methods" && call.child_by_field_name("receiver").is_none() {
+            Self::scan_body(source, &inner, info, true, shared_paths);
+        } else {
+            let mut scratch = Scope::new(String::new(), false);
+            Self::scan_body(source, &inner, &mut scratch, false, shared_paths);
+            info.warnings.append(&mut scratch.warnings);
+            if scratch.has_members() {
+                info.warnings.push(format!(
+                    "line {}: annotated members inside `{} do ... end` are not emitted \
+                     (sentinel scans class and module bodies, not blocks)",
+                    line, method_name
+                ));
+            }
+        }
     }
 
     /// Strip a trailing ` -- description` from an `@rbs` tag value.
@@ -538,7 +662,7 @@ impl SentinelTranspiler {
 
     /// Record a warning for annotations that were seen but not turned into RBS.
     fn warn_dropped(
-        info: &mut ClassInfo,
+        info: &mut Scope,
         ann: &mut Option<String>,
         ann_line: usize,
         tags: &mut Vec<(usize, String, String)>,
@@ -561,7 +685,7 @@ impl SentinelTranspiler {
     fn scan_body(
         source: &str,
         children: &[Node],
-        info: &mut ClassInfo,
+        info: &mut Scope,
         singleton_context: bool,
         shared_paths: &[std::path::PathBuf],
     ) {
@@ -711,57 +835,45 @@ impl SentinelTranspiler {
                 }
                 "method" => {
                     pending_type_alias = None;
-                    let sig = match pending_annotation.take() {
-                        Some(s) => Some(s),
-                        None if !pending_tags.is_empty() => {
-                            Some(Self::sig_from_tags(source, child, &pending_tags))
-                        }
-                        None => None,
-                    };
-                    pending_tags.clear();
-                    if let Some(sig) = sig {
-                        if let Some(name_node) = child.child_by_field_name("name") {
-                            let method_name =
-                                Self::node_text(source, &name_node).to_string();
-                            let sig = Self::strip_annotations(&sig);
-                            if !Self::is_balanced(&sig) || sig.ends_with('(') {
-                                info.warnings.push(format!(
-                                    "line {}: malformed signature for `{}`: {}",
-                                    line, method_name, sig
-                                ));
-                            } else if singleton_context {
-                                info.self_methods.push((method_name, sig));
-                            } else {
-                                info.methods.push((method_name, sig));
-                            }
-                        }
-                    }
+                    Self::record_method(
+                        source, child, info, singleton_context,
+                        &mut pending_annotation, &mut pending_tags, line,
+                    );
                 }
                 "singleton_method" => {
                     pending_type_alias = None;
-                    let sig = match pending_annotation.take() {
-                        Some(s) => Some(s),
-                        None if !pending_tags.is_empty() => {
-                            Some(Self::sig_from_tags(source, child, &pending_tags))
-                        }
-                        None => None,
-                    };
-                    pending_tags.clear();
-                    if let Some(sig) = sig {
-                        if let Some(name_node) = child.child_by_field_name("name") {
-                            let method_name =
-                                Self::node_text(source, &name_node).to_string();
-                            let sig = Self::strip_annotations(&sig);
-                            if !Self::is_balanced(&sig) || sig.ends_with('(') {
-                                info.warnings.push(format!(
-                                    "line {}: malformed signature for `{}`: {}",
-                                    line, method_name, sig
-                                ));
-                            } else {
-                                info.self_methods.push((method_name, sig));
-                            }
+                    Self::record_method(
+                        source, child, info, true,
+                        &mut pending_annotation, &mut pending_tags, line,
+                    );
+                }
+                // A nested class or module: its members belong to it, so it gets its own scope.
+                "class" | "module" if child.is_named() => {
+                    pending_type_alias = None;
+                    Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
+                    info.children.push(Self::build_scope(source, child, shared_paths));
+                }
+                // `Pair = Struct.new(:a) do ... end`: the block is a different context, so its
+                // annotated defs are not emitted. Say so rather than drop them silently.
+                "assignment" if child.is_named() => {
+                    pending_type_alias = None;
+                    Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
+                    let call = child.child_by_field_name("right").filter(|r| r.kind() == "call");
+                    if let Some(call) = call {
+                        if let (Some(block), Some(method)) =
+                            (call.child_by_field_name("block"), call.child_by_field_name("method"))
+                        {
+                            let name = Self::node_text(source, &method);
+                            Self::scan_block(source, call, block, name, info, line, shared_paths);
                         }
                     }
+                }
+                // Definitions inside a conditional or `begin` belong to the enclosing scope.
+                "if" | "unless" | "case" | "begin" if child.is_named() => {
+                    pending_type_alias = None;
+                    Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
+                    let inner = Self::flatten_control(child);
+                    Self::scan_body(source, &inner, info, singleton_context, shared_paths);
                 }
                 "singleton_class" => {
                     // class << self — methods inside are class methods
@@ -816,6 +928,18 @@ impl SentinelTranspiler {
                                 }
                             }
                             Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
+                        } else if let Some(def) = Self::wrapped_def(child, method_name) {
+                            // `private def foo`: the signature above it is the def's.
+                            handled = true;
+                            let to_self = def.kind() == "singleton_method" || singleton_context;
+                            Self::record_method(
+                                source, def, info, to_self,
+                                &mut pending_annotation, &mut pending_tags, line,
+                            );
+                        } else if let Some(block) = child.child_by_field_name("block") {
+                            handled = true;
+                            Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
+                            Self::scan_block(source, child, block, method_name, info, line, shared_paths);
                         }
                     }
                     if !handled {
@@ -873,137 +997,40 @@ impl SentinelTranspiler {
         is_const_path.then(|| name.to_string())
     }
 
+    /// Find the top-level classes and modules under `node`.
     fn walk(
         source: &str,
         node: Node,
-        module_stack: &mut Vec<String>,
-        info: &mut ClassInfo,
+        scopes: &mut Vec<Scope>,
         shared_paths: &[std::path::PathBuf],
     ) {
-        match node.kind() {
-            "module" => {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = Self::node_text(source, &name_node);
-                    let segments: Vec<&str> = name.split("::").collect();
-                    let pushed = segments.len();
-                    for seg in &segments {
-                        module_stack.push(seg.to_string());
-                    }
-
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        Self::walk(source, child, module_stack, info, shared_paths);
-                    }
-
-                    // If no class was found inside, check if this module
-                    // itself contains annotated content (e.g. concerns)
-                    if info.class_name == "UnknownClass" {
-                        let children = Self::flatten_children(node);
-                        Self::scan_body(source, &children, info, false, shared_paths);
-                        if !info.methods.is_empty()
-                            || !info.self_methods.is_empty()
-                            || !info.type_aliases.is_empty()
-                            || !info.attributes.is_empty()
-                        {
-                            for _ in 0..pushed {
-                                module_stack.pop();
-                            }
-                            info.modules = module_stack.clone();
-                            info.class_name = name.to_string();
-                            info.is_module = true;
-                            return;
-                        }
-                    } else if info.is_module {
-                        // A nested module (e.g. ClassMethods) was already captured.
-                        // Check if the parent module also has its own annotated methods.
-                        // If so, demote the nested module to a sub_module and promote
-                        // the parent as the primary module.
-                        let mut parent_info = ClassInfo {
-                            modules: Vec::new(),
-                            class_name: "UnknownClass".to_string(),
-                            superclass: None,
-                            is_module: false,
-                            methods: Vec::new(),
-                            self_methods: Vec::new(),
-                            type_aliases: Vec::new(),
-                            attributes: Vec::new(),
-                            ivars: Vec::new(),
-                            sub_modules: Vec::new(),
-                            warnings: Vec::new(),
-                        };
-                        let children = Self::flatten_children(node);
-                        Self::scan_body(source, &children, &mut parent_info, false, shared_paths);
-                        info.warnings.append(&mut parent_info.warnings);
-                        if !parent_info.methods.is_empty()
-                            || !parent_info.self_methods.is_empty()
-                            || !parent_info.type_aliases.is_empty()
-                            || !parent_info.attributes.is_empty()
-                        {
-                            // Move the previously captured nested module into sub_modules
-                            let nested = SubModuleInfo {
-                                name: info.class_name.clone(),
-                                methods: info.methods.drain(..).collect(),
-                                self_methods: info.self_methods.drain(..).collect(),
-                                type_aliases: info.type_aliases.drain(..).collect(),
-                                attributes: info.attributes.drain(..).collect(),
-                            };
-                            info.sub_modules.push(nested);
-                            // Replace with parent module's content
-                            info.methods = parent_info.methods;
-                            info.self_methods = parent_info.self_methods;
-                            info.type_aliases = parent_info.type_aliases;
-                            info.attributes = parent_info.attributes;
-                            for _ in 0..pushed {
-                                module_stack.pop();
-                            }
-                            info.modules = module_stack.clone();
-                            info.class_name = name.to_string();
-                            info.is_module = true;
-                            return;
-                        }
-                    }
-
-                    for _ in 0..pushed {
-                        module_stack.pop();
-                    }
-                    return;
-                }
-            }
-            "class" => {
-                // Snapshot the current module stack — this is the nesting at class definition
-                info.modules = module_stack.clone();
-                info.is_module = false;
-
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    info.class_name = Self::node_text(source, &name_node).to_string();
-                }
-
-                // Set unconditionally: a previously scanned sibling class must not
-                // leak its parent onto this one.
-                info.superclass = node
-                    .child_by_field_name("superclass")
-                    .and_then(|n| Self::parse_superclass(Self::node_text(source, &n)));
-
-                // Clear any data from a previously scanned module container
-                info.methods.clear();
-                info.self_methods.clear();
-                info.type_aliases.clear();
-                info.attributes.clear();
-                info.ivars.clear();
-
-                // Flatten direct children + body_statement children, then scan
-                let children = Self::flatten_children(node);
-                Self::scan_body(source, &children, info, false, shared_paths);
-
-                return;
-            }
-            _ => {}
+        // Keyword tokens (`class`, `module`) share their name with the real nodes.
+        if node.is_named() && matches!(node.kind(), "class" | "module") {
+            scopes.push(Self::build_scope(source, node, shared_paths));
+            return;
         }
-
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            Self::walk(source, child, module_stack, info, shared_paths);
+            Self::walk(source, child, scopes, shared_paths);
         }
+    }
+
+    /// Build the scope for a `class` or `module` node, including everything nested in it.
+    fn build_scope(source: &str, node: Node, shared_paths: &[std::path::PathBuf]) -> Scope {
+        let is_module = node.kind() == "module";
+        let name = node
+            .child_by_field_name("name")
+            .map(|n| Self::node_text(source, &n).to_string())
+            .unwrap_or_else(|| "UnknownClass".to_string());
+        let mut scope = Scope::new(name, is_module);
+        if !is_module {
+            scope.superclass = node
+                .child_by_field_name("superclass")
+                .and_then(|n| Self::parse_superclass(Self::node_text(source, &n)));
+        }
+        let children = Self::flatten_children(node);
+        Self::scan_body(source, &children, &mut scope, false, shared_paths);
+        scope
     }
 
     /// Returns true if the generated RBS has meaningful content worth writing
@@ -1146,135 +1173,125 @@ impl SentinelTranspiler {
     pub fn transpile_source(&mut self, source: &str) -> anyhow::Result<String> {
         let tree = self.parser.parse(source, None).context("Failed to parse")?;
 
-        let info = Self::collect_structure(source, tree.root_node(), &self.shared_paths);
-        self.warnings = info.warnings.clone();
+        let scopes = Self::collect_structure(source, tree.root_node(), &self.shared_paths);
+        let mut warnings = Vec::new();
+        for scope in &scopes {
+            scope.all_warnings(&mut warnings);
+        }
+        // Source order (nested scopes are collected after their parent). The sort is stable.
+        warnings.sort_by_key(|w| {
+            w.strip_prefix("line ")
+                .and_then(|r| r.split_once(": "))
+                .and_then(|(n, _)| n.parse::<usize>().ok())
+                .unwrap_or(0)
+        });
+        self.warnings = warnings;
 
-        let mut rbs_output = String::new();
-        rbs_output.push_str("# Generated by Sentinel - Do not edit manually\n\n");
+        let mut rbs_output = String::from("# Generated by Sentinel - Do not edit manually\n\n");
+        let header_len = rbs_output.len();
+        for scope in &scopes {
+            self.emit_scope(scope, 0, false, &mut rbs_output);
+        }
+        if rbs_output.len() == header_len {
+            // Nothing is annotated: still say what the file defines, as one empty scope.
+            match scopes.first() {
+                Some(first) => self.emit_scope(first, 0, true, &mut rbs_output),
+                None => rbs_output.push_str("class UnknownClass\nend\n"),
+            }
+        }
+        Ok(rbs_output)
+    }
 
-        // Emit nested module/class structure
-        let depth = info.modules.len();
-        for (i, module_name) in info.modules.iter().enumerate() {
-            let indent = "  ".repeat(i);
-            rbs_output.push_str(&format!("{}module {}\n", indent, module_name));
+    /// Write `scope` and everything nested in it, indented `depth` levels. Scopes with
+    /// nothing to emit are skipped unless `force` is set (which also limits the output
+    /// to the first nested scope, so an unannotated file prints one short chain).
+    fn emit_scope(&self, scope: &Scope, depth: usize, force: bool, out: &mut String) {
+        if !force && !scope.has_output() {
+            return;
         }
 
-        let class_indent = "  ".repeat(depth);
-        let member_indent = "  ".repeat(depth + 1);
-        let keyword = if info.is_module { "module" } else { "class" };
+        // A module that only wraps other scopes is written as nested modules
+        // (`module A::B` becomes `module A` / `module B`); a scope with members of its
+        // own keeps its name as written.
+        let wrapper = scope.is_module
+            && !scope.has_members()
+            && scope.name.contains("::")
+            && !scope.name.starts_with("::");
+        let names: Vec<&str> = if wrapper {
+            scope.name.split("::").collect()
+        } else {
+            vec![scope.name.as_str()]
+        };
+        let keyword = if scope.is_module { "module" } else { "class" };
         // Superclass is emitted so Steep can resolve inherited methods, macros and
         // type aliases. Without it every generated class looks like it inherits from
         // Object, so class-level DSL calls (`wraps`, `authorization`, ...) and
         // inherited helpers are invisible to the type checker.
-        let inherits = match (&info.superclass, info.is_module, self.emit_superclasses) {
+        let inherits = match (&scope.superclass, scope.is_module, self.emit_superclasses) {
             (Some(parent), false, true) => format!(" < {}", parent),
             _ => String::new(),
         };
-        rbs_output.push_str(&format!(
-            "{}{} {}{}\n",
-            class_indent, keyword, info.class_name, inherits
-        ));
+        for (i, name) in names.iter().enumerate() {
+            let extra = if i + 1 == names.len() { inherits.as_str() } else { "" };
+            out.push_str(&format!("{}{} {}{}\n", "  ".repeat(depth + i), keyword, name, extra));
+        }
+
+        let body_depth = depth + names.len();
+        let member_indent = "  ".repeat(body_depth);
 
         // Type aliases
-        for alias in &info.type_aliases {
+        for alias in &scope.type_aliases {
             // If the RHS of the alias is a record type with many entries, format it
             // on multiple lines so that the generated file stays readable.
             let formatted = if let Some(eq_pos) = alias.find(" = ") {
                 let lhs = &alias[..eq_pos + 3]; // "type foo = "
                 let rhs = alias[eq_pos + 3..].trim();
                 let field_indent = format!("{}  ", member_indent);
-                let formatted_rhs =
-                    Self::maybe_format_record(rhs, &field_indent, &member_indent);
+                let formatted_rhs = Self::maybe_format_record(rhs, &field_indent, &member_indent);
                 format!("{}{}", lhs, formatted_rhs)
             } else {
                 alias.clone()
             };
-            rbs_output.push_str(&format!("{}{}\n", member_indent, formatted));
+            out.push_str(&format!("{}{}\n", member_indent, formatted));
         }
 
         // Attributes
-        for (kind, name, type_sig) in &info.attributes {
-            rbs_output.push_str(&format!(
-                "{}{} {}: {}\n",
-                member_indent, kind, name, type_sig
-            ));
+        for (kind, name, type_sig) in &scope.attributes {
+            out.push_str(&format!("{}{} {}: {}\n", member_indent, kind, name, type_sig));
         }
 
         // Instance variables
-        for (name, ty) in &info.ivars {
-            rbs_output.push_str(&format!("{}{}: {}\n", member_indent, name, ty));
+        for (name, ty) in &scope.ivars {
+            out.push_str(&format!("{}{}: {}\n", member_indent, name, ty));
         }
 
         // Class methods
-        for (name, sig) in &info.self_methods {
-            let param_indent = format!("{}  ", member_indent);
+        let param_indent = format!("{}  ", member_indent);
+        for (name, sig) in &scope.self_methods {
             let formatted_sig = Self::maybe_format_sig(sig, &param_indent, &member_indent);
-            rbs_output.push_str(&format!(
-                "{}def self.{}: {}\n",
-                member_indent, name, formatted_sig
-            ));
+            out.push_str(&format!("{}def self.{}: {}\n", member_indent, name, formatted_sig));
         }
 
         // Instance methods
-        for (name, sig) in &info.methods {
-            let param_indent = format!("{}  ", member_indent);
+        for (name, sig) in &scope.methods {
             let formatted_sig = Self::maybe_format_sig(sig, &param_indent, &member_indent);
-            rbs_output.push_str(&format!("{}def {}: {}\n", member_indent, name, formatted_sig));
+            out.push_str(&format!("{}def {}: {}\n", member_indent, name, formatted_sig));
         }
 
-        // Sub-modules (e.g. ClassMethods inside a concern)
-        for sub in &info.sub_modules {
-            let sub_indent = "  ".repeat(depth + 1);
-            let sub_member_indent = "  ".repeat(depth + 2);
-            rbs_output.push_str(&format!("{}module {}\n", sub_indent, sub.name));
-            for alias in &sub.type_aliases {
-                let formatted = if let Some(eq_pos) = alias.find(" = ") {
-                    let lhs = &alias[..eq_pos + 3];
-                    let rhs = alias[eq_pos + 3..].trim();
-                    let field_indent = format!("{}  ", sub_member_indent);
-                    let formatted_rhs =
-                        Self::maybe_format_record(rhs, &field_indent, &sub_member_indent);
-                    format!("{}{}", lhs, formatted_rhs)
-                } else {
-                    alias.clone()
-                };
-                rbs_output.push_str(&format!("{}{}\n", sub_member_indent, formatted));
+        // Nested classes and modules (e.g. ClassMethods inside a concern)
+        if force {
+            if let Some(first) = scope.children.first() {
+                self.emit_scope(first, body_depth, true, out);
             }
-            for (kind, name, type_sig) in &sub.attributes {
-                rbs_output.push_str(&format!(
-                    "{}{} {}: {}\n",
-                    sub_member_indent, kind, name, type_sig
-                ));
+        } else {
+            for child in &scope.children {
+                self.emit_scope(child, body_depth, false, out);
             }
-            for (name, sig) in &sub.self_methods {
-                let param_indent = format!("{}  ", sub_member_indent);
-                let formatted_sig =
-                    Self::maybe_format_sig(sig, &param_indent, &sub_member_indent);
-                rbs_output.push_str(&format!(
-                    "{}def self.{}: {}\n",
-                    sub_member_indent, name, formatted_sig
-                ));
-            }
-            for (name, sig) in &sub.methods {
-                let param_indent = format!("{}  ", sub_member_indent);
-                let formatted_sig =
-                    Self::maybe_format_sig(sig, &param_indent, &sub_member_indent);
-                rbs_output.push_str(&format!(
-                    "{}def {}: {}\n",
-                    sub_member_indent, name, formatted_sig
-                ));
-            }
-            rbs_output.push_str(&format!("{}end\n", sub_indent));
         }
 
-        rbs_output.push_str(&format!("{}end\n", class_indent));
-
-        for i in (0..depth).rev() {
-            let indent = "  ".repeat(i);
-            rbs_output.push_str(&format!("{}end\n", indent));
+        for i in (0..names.len()).rev() {
+            out.push_str(&format!("{}end\n", "  ".repeat(depth + i)));
         }
-
-        Ok(rbs_output)
     }
 }
 
@@ -2817,5 +2834,189 @@ end
         let w = t.take_warnings();
         assert_eq!(w.len(), 1, "{:?}", w);
         assert_eq!(w[0].line, 2);
+    }
+
+    // ---- one file, many scopes (#35) ------------------------------------------------
+
+    fn rbs(src: &str) -> String {
+        SentinelTranspiler::new().transpile_source(src).unwrap()
+    }
+
+    fn body(rbs: &str) -> String {
+        rbs.split_once("\n\n").map(|(_, b)| b.to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn nested_class_is_emitted_inside_its_parent() {
+        let out = rbs("class Outer\n  #: () -> void\n  def outer_m; end\n\n  class Inner\n    #: () -> Integer\n    def inner_m; 1; end\n  end\nend\n");
+        assert_eq!(
+            body(&out),
+            "class Outer\n  def outer_m: () -> void\n  class Inner\n    def inner_m: () -> Integer\n  end\nend\n"
+        );
+    }
+
+    #[test]
+    fn sibling_classes_are_all_emitted() {
+        let out = rbs("class A\n  #: () -> void\n  def a; end\nend\n\nclass B\n  #: () -> void\n  def b; end\nend\n");
+        assert_eq!(body(&out), "class A\n  def a: () -> void\nend\nclass B\n  def b: () -> void\nend\n");
+    }
+
+    #[test]
+    fn module_before_or_after_a_class_is_emitted() {
+        for order in [0, 1] {
+            let class = "  class Err\n    #: () -> void\n    def e; end\n  end\n";
+            let module = "  module Helper\n    #: () -> void\n    def h; end\n  end\n";
+            let inner = if order == 0 { format!("{class}\n{module}") } else { format!("{module}\n{class}") };
+            let out = rbs(&format!("module Ns\n{inner}end\n"));
+            assert!(out.contains("    def e: () -> void"), "{out}");
+            assert!(out.contains("    def h: () -> void"), "{out}");
+            assert!(out.starts_with("# Generated") && out.contains("module Ns\n"), "{out}");
+        }
+    }
+
+    #[test]
+    fn module_with_own_methods_and_a_nested_class() {
+        // A concern with an error class: previously nothing was written at all.
+        let out = rbs("module Redirecting\n  class UnsafeRedirectError < StandardError; end\n\n  #: (String) -> void\n  def redirect_to(url); end\n\n  #: () -> bool\n  def redirected?; true; end\nend\n");
+        assert_eq!(
+            body(&out),
+            "module Redirecting\n  def redirect_to: (String) -> void\n  def redirected?: () -> bool\nend\n"
+        );
+        assert!(SentinelTranspiler::has_content(&out));
+    }
+
+    #[test]
+    fn class_with_own_methods_and_a_nested_module() {
+        let out = rbs("class Model\n  #: () -> void\n  def save; end\n\n  module Callbacks\n    #: () -> void\n    def before_save; end\n  end\nend\n");
+        assert_eq!(
+            body(&out),
+            "class Model\n  def save: () -> void\n  module Callbacks\n    def before_save: () -> void\n  end\nend\n"
+        );
+    }
+
+    #[test]
+    fn scopes_without_annotations_are_not_emitted() {
+        let out = rbs("module Ns\n  class Quiet\n    def x; end\n  end\n\n  class Loud\n    #: () -> void\n    def y; end\n  end\nend\n");
+        assert_eq!(body(&out), "module Ns\n  class Loud\n    def y: () -> void\n  end\nend\n");
+    }
+
+    #[test]
+    fn wrapper_module_with_scope_resolution_is_split() {
+        let out = rbs("module A::B\n  class C\n    #: () -> void\n    def c; end\n  end\nend\n");
+        assert_eq!(body(&out), "module A\n  module B\n    class C\n      def c: () -> void\n    end\n  end\nend\n");
+    }
+
+    #[test]
+    fn nothing_annotated_still_names_one_scope() {
+        assert_eq!(body(&rbs("class Plain\n  def x; end\nend\n")), "class Plain\nend\n");
+        assert_eq!(body(&rbs("module A\n  class B\n  end\n  class C\n  end\nend\n")), "module A\n  class B\n  end\nend\n");
+        assert_eq!(body(&rbs("# nothing here\n")), "class UnknownClass\nend\n");
+    }
+
+    #[test]
+    fn nested_classes_get_their_own_superclass_when_enabled() {
+        let mut t = SentinelTranspiler::new();
+        t.set_emit_superclasses(true);
+        let out = t
+            .transpile_source("class Base\n  #: () -> void\n  def a; end\n\n  class Inner < Base\n    #: () -> void\n    def b; end\n  end\nend\n")
+            .unwrap();
+        assert!(out.contains("  class Inner < Base\n"), "{out}");
+    }
+
+    #[test]
+    fn warnings_from_nested_scopes_come_out_in_source_order() {
+        let mut t = SentinelTranspiler::new();
+        t.transpile_source("class A\n  class B\n    #: (Integer -> void\n    def late; end\n  end\n\n  #: (String -> void\n  def early_in_file_order; end\nend\n")
+            .unwrap();
+        let w = t.take_warnings();
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].line < w[1].line, "{w:?}");
+    }
+
+    // ---- visibility wrappers (#36) ---------------------------------------------------
+
+    #[test]
+    fn visibility_wrapped_defs_keep_their_signature() {
+        let out = rbs("class P\n  #: () -> void\n  def shown; end\n\n  #: (String) -> bool\n  private def hidden(s); true; end\n\n  #: () -> void\n  protected def guarded; end\n\n  #: () -> void\n  public def open; end\nend\n");
+        for want in ["def shown: () -> void", "def hidden: (String) -> bool", "def guarded: () -> void", "def open: () -> void"] {
+            assert!(out.contains(want), "missing {want}: {out}");
+        }
+    }
+
+    #[test]
+    fn module_function_and_private_class_method_defs() {
+        let out = rbs("module U\n  #: (Integer) -> Integer\n  module_function def twice(x); x * 2; end\nend\n");
+        assert!(out.contains("  def twice: (Integer) -> Integer"), "{out}");
+        let out = rbs("class K\n  #: () -> Integer\n  private_class_method def self.build; 1; end\nend\n");
+        assert!(out.contains("  def self.build: () -> Integer"), "{out}");
+    }
+
+    #[test]
+    fn visibility_wrapped_defs_work_inside_class_self() {
+        let out = rbs("class K\n  class << self\n    #: () -> Integer\n    private def make; 1; end\n  end\nend\n");
+        assert!(out.contains("  def self.make: () -> Integer"), "{out}");
+    }
+
+    #[test]
+    fn bare_visibility_keywords_do_not_disturb_following_defs() {
+        let out = rbs("class P\n  private\n\n  #: () -> void\n  def hidden; end\nend\n");
+        assert!(out.contains("def hidden: () -> void"), "{out}");
+    }
+
+    // ---- conditionals and blocks (#37) -----------------------------------------------
+
+    #[test]
+    fn defs_in_conditionals_and_begin_are_emitted() {
+        let out = rbs("class C\n  if RUBY_VERSION >= \"3.2\"\n    #: () -> void\n    def newer; end\n  elsif RUBY_VERSION >= \"3.0\"\n    #: () -> void\n    def middle; end\n  else\n    #: () -> void\n    def older; end\n  end\n\n  unless defined?(Foo)\n    #: () -> void\n    def no_foo; end\n  end\n\n  begin\n    #: () -> Integer\n    def risky; 1; end\n  rescue StandardError\n    nil\n  end\nend\n");
+        for want in ["def newer:", "def middle:", "def older:", "def no_foo:", "def risky: () -> Integer"] {
+            assert!(out.contains(want), "missing {want}: {out}");
+        }
+    }
+
+    #[test]
+    fn dangling_annotation_before_a_conditional_still_warns() {
+        let mut t = SentinelTranspiler::new();
+        t.transpile_source("class C\n  #: () -> void\n  if true\n    def x; end\n  end\nend\n").unwrap();
+        let w = t.take_warnings();
+        assert!(w.iter().any(|w| w.message.contains("not attached")), "{w:?}");
+    }
+
+    #[test]
+    fn class_methods_block_declares_class_methods() {
+        let out = rbs("module Concern\n  extend ActiveSupport::Concern\n\n  class_methods do\n    #: () -> String\n    def finder; \"\"; end\n  end\nend\n");
+        assert!(out.contains("  def self.finder: () -> String"), "{out}");
+    }
+
+    #[test]
+    fn other_blocks_warn_instead_of_dropping_silently() {
+        let mut t = SentinelTranspiler::new();
+        let out = t
+            .transpile_source("module Concern\n  included do\n    #: () -> void\n    def from_included; end\n  end\n\n  #: () -> void\n  def kept; end\nend\n")
+            .unwrap();
+        assert!(out.contains("def kept") && !out.contains("from_included"), "{out}");
+        let w = t.take_warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].line, 2);
+        assert!(w[0].message.contains("included do"), "{w:?}");
+    }
+
+    #[test]
+    fn struct_new_blocks_warn_too() {
+        let mut t = SentinelTranspiler::new();
+        let out = t
+            .transpile_source("class Host\n  Pair = Struct.new(:a, :b) do\n    #: () -> Integer\n    def sum; a + b; end\n  end\n\n  #: () -> void\n  def real; end\nend\n")
+            .unwrap();
+        assert!(out.contains("def real") && !out.contains("def sum"), "{out}");
+        let w = t.take_warnings();
+        assert!(w.iter().any(|w| w.message.contains("new do")), "{w:?}");
+    }
+
+    #[test]
+    fn brace_blocks_are_scanned_like_do_blocks() {
+        let mut t = SentinelTranspiler::new();
+        let out = t
+            .transpile_source("module Concern\n  class_methods {\n    #: () -> String\n    def finder; \"\"; end\n  }\nend\n")
+            .unwrap();
+        assert!(out.contains("def self.finder: () -> String"), "{out}");
     }
 }
