@@ -76,7 +76,12 @@ pub struct Warning {
     /// 1-based source line.
     pub line: usize,
     pub message: String,
+    /// The file did not parse, so the generated RBS may be incomplete or wrongly namespaced.
+    pub syntax_error: bool,
 }
+
+/// Prefix of the warning for a file that does not parse.
+const SYNTAX_ERROR_PREFIX: &str = "syntax error";
 
 pub struct SentinelTranspiler {
     parser: Parser,
@@ -111,8 +116,12 @@ impl SentinelTranspiler {
                 // Internal warnings are recorded as "line N: message".
                 let parsed = w.strip_prefix("line ").and_then(|r| r.split_once(": "));
                 match parsed.and_then(|(n, m)| Some((n.parse::<usize>().ok()?, m))) {
-                    Some((line, message)) => Warning { line, message: message.to_string() },
-                    None => Warning { line: 1, message: w },
+                    Some((line, message)) => Warning {
+                        line,
+                        syntax_error: message.starts_with(SYNTAX_ERROR_PREFIX),
+                        message: message.to_string(),
+                    },
+                    None => Warning { line: 1, message: w, syntax_error: false },
                 }
             })
             .collect()
@@ -1193,12 +1202,35 @@ impl SentinelTranspiler {
         self.transpile_source(&source)
     }
 
+    /// The first `ERROR` or missing node under `node`, in source order.
+    fn first_error(node: Node) -> Option<Node> {
+        if node.is_error() || node.is_missing() {
+            return Some(node);
+        }
+        if !node.has_error() {
+            return None;
+        }
+        let mut cursor = node.walk();
+        node.children(&mut cursor).find_map(Self::first_error)
+    }
+
     /// Transpile Ruby `source` held in memory; no file is read or written.
     pub fn transpile_source(&mut self, source: &str) -> anyhow::Result<String> {
         let tree = self.parser.parse(source, None).context("Failed to parse")?;
 
         let scopes = Self::collect_structure(source, tree.root_node(), &self.shared_paths);
         let mut warnings = Vec::new();
+        // Tree-sitter recovers from syntax errors, so a broken file still yields output:
+        // possibly none, possibly under the wrong namespace. Say so.
+        if tree.root_node().has_error() {
+            let line = Self::first_error(tree.root_node())
+                .map(|n| n.start_position().row + 1)
+                .unwrap_or(1);
+            warnings.push(format!(
+                "line {}: {}; the generated RBS may be incomplete or wrongly namespaced",
+                line, SYNTAX_ERROR_PREFIX
+            ));
+        }
         for scope in &scopes {
             scope.all_warnings(&mut warnings);
         }
@@ -2804,6 +2836,24 @@ end
         assert!(out.contains("def kept: () -> void"), "{}", out);
         assert!(out.contains("def hidden: () -> void"), "{}", out);
         assert!(out.contains("def self.make: () -> void"), "{}", out);
+    }
+
+    #[test]
+    fn syntax_errors_are_reported() {
+        // Missing `end` on the outermost module drops its namespace.
+        let src = "module Outer\n  module Inner\n    #: () -> void\n    def f; end\n  end\n";
+        let (_, warnings) = transpile_str("sentinel_syntax_missing_end.rb", src);
+        assert!(warnings.iter().any(|w| w.starts_with("syntax error")), "{:?}", warnings);
+
+        // A truncated file.
+        let src = "module Outer\n  class Widget\n    #: () -> void\n    def f; end\n";
+        let (_, warnings) = transpile_str("sentinel_syntax_truncated.rb", src);
+        assert!(warnings.iter().any(|w| w.starts_with("syntax error")), "{:?}", warnings);
+
+        // Valid Ruby draws no such warning.
+        let src = "class A\n  #: () -> void\n  def f; end\nend\n";
+        let (_, warnings) = transpile_str("sentinel_syntax_ok.rb", src);
+        assert!(warnings.is_empty(), "{:?}", warnings);
     }
 
     #[test]

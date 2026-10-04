@@ -152,7 +152,11 @@ impl Backend {
             let line = w.line.saturating_sub(1);
             diagnostics.push(Diagnostic {
                 range: Self::line_range(&source_lines, line),
-                severity: Some(DiagnosticSeverity::WARNING),
+                severity: Some(if w.syntax_error {
+                    DiagnosticSeverity::ERROR
+                } else {
+                    DiagnosticSeverity::WARNING
+                }),
                 source: Some("sentinel::annotations".to_string()),
                 message: w.message,
                 ..Diagnostic::default()
