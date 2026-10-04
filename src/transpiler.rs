@@ -875,6 +875,30 @@ impl SentinelTranspiler {
                     let inner = Self::flatten_control(child);
                     Self::scan_body(source, &inner, info, singleton_context, shared_paths);
                 }
+                // `def foo ... end unless method_defined?(:foo)`: the def is the modifier's body.
+                "if_modifier" | "unless_modifier" => {
+                    pending_type_alias = None;
+                    let body = child.child_by_field_name("body");
+                    let def = body.and_then(|b| match b.kind() {
+                        "method" | "singleton_method" => Some(b),
+                        "call" => b
+                            .child_by_field_name("method")
+                            .and_then(|m| Self::wrapped_def(b, Self::node_text(source, &m))),
+                        _ => None,
+                    });
+                    match def {
+                        Some(def) => {
+                            let to_self = def.kind() == "singleton_method" || singleton_context;
+                            Self::record_method(
+                                source, def, info, to_self,
+                                &mut pending_annotation, &mut pending_tags, line,
+                            );
+                        }
+                        None => Self::warn_dropped(
+                            info, &mut pending_annotation, pending_ann_line, &mut pending_tags,
+                        ),
+                    }
+                }
                 "singleton_class" => {
                     // class << self — methods inside are class methods
                     let inner_children = Self::flatten_children(child);
@@ -2769,6 +2793,17 @@ end
         let mut t = SentinelTranspiler::new();
         let out = t.transpile_file(&path).unwrap();
         (out, t.take_warnings().into_iter().map(|w| w.message).collect())
+    }
+
+    #[test]
+    fn modifier_conditional_def_is_attached() {
+        let src = "class IndifferentHash\n  #: (*untyped keys) -> untyped\n  def except(*keys)\n    dup\n  end unless method_defined?(:except)\n\n  #: () -> void\n  def kept; end\n\n  #: () -> void\n  private def hidden; end if true\n\n  #: () -> void\n  def self.make; end if RUBY_VERSION\nend\n";
+        let (out, warnings) = transpile_str("sentinel_modifier_def.rb", src);
+        assert!(warnings.is_empty(), "{:?}", warnings);
+        assert!(out.contains("def except: (*untyped keys) -> untyped"), "{}", out);
+        assert!(out.contains("def kept: () -> void"), "{}", out);
+        assert!(out.contains("def hidden: () -> void"), "{}", out);
+        assert!(out.contains("def self.make: () -> void"), "{}", out);
     }
 
     #[test]

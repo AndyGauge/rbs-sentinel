@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- A `#:` signature above a def with a trailing `if`/`unless` modifier (`def x; end unless method_defined?(:x)`, `private def x; end if cond`) is attached to the method instead of being reported as not attached (#41).
+
 ## [0.7.0] - 2026-10-03
 
 ### Added
