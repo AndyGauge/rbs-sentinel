@@ -172,20 +172,17 @@ impl Backend {
             let mut transpiler = SentinelTranspiler::new();
             transpiler.set_shared_paths(shared);
             transpiler.set_emit_superclasses(emit_superclasses);
-            // Same non-`Send` error dance as `sync_and_lint`: go through the message.
-            let rbs = transpiler
-                .transpile_source(&text)
-                .map_err(|e| e.to_string())?;
+            let rbs = transpiler.transpile_source(&text)?;
             let diagnostics = Self::lint(&text, &rbs, transpiler.take_warnings());
-            Ok::<_, String>(TranspileResult { rbs, diagnostics })
+            Ok::<_, anyhow::Error>(TranspileResult { rbs, diagnostics })
         })
         .await;
 
         match result {
             Ok(Ok(out)) => Ok(out),
-            Ok(Err(message)) => Err(tower_lsp::jsonrpc::Error {
+            Ok(Err(e)) => Err(tower_lsp::jsonrpc::Error {
                 code: tower_lsp::jsonrpc::ErrorCode::InternalError,
-                message: message.into(),
+                message: format!("{e:#}").into(),
                 data: None,
             }),
             Err(e) => Err(tower_lsp::jsonrpc::Error {
@@ -240,13 +237,7 @@ impl Backend {
             let mut transpiler = SentinelTranspiler::new();
             transpiler.set_shared_paths(shared);
             transpiler.set_emit_superclasses(emit_superclasses);
-            // `transpile_file` returns `Box<dyn std::error::Error>`, which is
-            // not `Send` and so can't cross this `spawn_blocking` boundary via
-            // `?`'s blanket `From` impl into `anyhow::Error` — convert via the
-            // message instead of the original (non-Send) error value.
-            let rbs = transpiler
-                .transpile_file(&blocking_path)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let rbs = transpiler.transpile_file(&blocking_path)?;
             if SentinelTranspiler::has_content(&rbs) {
                 let target = derive_sig_path(&app_root, &blocking_path, &output);
                 if let Some(parent) = target.parent() {

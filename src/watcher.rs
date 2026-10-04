@@ -1,7 +1,7 @@
 use crate::config::SentinelConfig;
 use crate::plugin::Plugin;
 use crate::transpiler::SentinelTranspiler;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -92,9 +92,10 @@ impl SentinelWatcher {
                 }
             }
 
-            // Process all unique changed .rb files
+            // Process all unique changed .rb files. The transpiler is handed
+            // into handle_change and returned, so it is reused across changes.
             for path in &changed_paths {
-                self.handle_change(&mut transpiler, path).await;
+                transpiler = self.handle_change(transpiler, path).await;
             }
         }
     }
@@ -104,19 +105,48 @@ impl SentinelWatcher {
         self.app_roots.iter().find(|root| path.starts_with(root))
     }
 
-    async fn handle_change(&self, transpiler: &mut SentinelTranspiler, path: &Path) {
+    async fn handle_change(
+        &self,
+        mut transpiler: SentinelTranspiler,
+        path: &Path,
+    ) -> SentinelTranspiler {
         println!(
             "🔍 Change detected: {:?}",
             path.file_name().unwrap_or_default()
         );
 
-        let result = transpiler.transpile_file(path);
-        for w in transpiler.take_warnings() {
+        // Pure path math: cheap, so leave it on the async thread.
+        let target_path = self.derive_sig_path(path);
+
+        // Owned copies to move across the blocking boundary.
+        let rb_path = path.to_path_buf();
+        let target = target_path.clone();
+
+        // Tree-sitter parsing, the .rb read, and the .rbs write are blocking and
+        // CPU-bound. Run them on the blocking pool, not a tokio worker thread.
+        // The transpiler moves in and comes back out so we keep reusing it.
+        let (transpiler, result, warnings) = tokio::task::spawn_blocking(move || {
+            let result = (|| -> anyhow::Result<String> {
+                let rbs = transpiler.transpile_file(&rb_path).context("transpiling")?;
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(&target, &rbs).context("writing RBS")?;
+                Ok(rbs)
+            })();
+            // Taken here: it needs the transpiler, which is only ours inside this closure.
+            let warnings = transpiler.take_warnings();
+            (transpiler, result, warnings)
+        })
+        .await
+        .expect("transpile task panicked");
+
+        for w in warnings {
             eprintln!("⚠️  [warn] {}:{}: {}", path.display(), w.line, w.message);
         }
         match result {
             Ok(rbs_content) => {
-                // 1. RUN PLUGINS (The new linter system)
+                // Plugin lints are cheap string scans, so run them here.
                 for plugin in Plugin::ALL {
                     let issues = plugin.check(&rbs_content);
                     if !issues.is_empty() {
@@ -130,23 +160,12 @@ impl SentinelWatcher {
                         }
                     }
                 }
-
-                let target_path = self.derive_sig_path(path);
-
-                // 2. Ensure directory exists
-                if let Some(parent) = target_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-
-                // 3. Write file
-                if let Err(e) = std::fs::write(&target_path, &rbs_content) {
-                    eprintln!("❌ Failed to write RBS: {}", e);
-                } else {
-                    println!("✅ RBS Synced -> {:?}", target_path);
-                }
+                println!("✅ RBS Synced -> {:?}", target_path);
             }
-            Err(e) => eprintln!("❌ Transpiler error: {}", e),
+            Err(e) => eprintln!("❌ {:#}", e),
         }
+
+        transpiler
     }
 
     fn derive_sig_path(&self, rb_path: &Path) -> PathBuf {

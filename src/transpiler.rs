@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::fs;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -1136,17 +1137,14 @@ impl SentinelTranspiler {
     pub fn transpile_file(
         &mut self,
         rb_path: &Path,
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<String> {
         let source = fs::read_to_string(rb_path)?;
         self.transpile_source(&source)
     }
 
     /// Transpile Ruby `source` held in memory; no file is read or written.
-    pub fn transpile_source(
-        &mut self,
-        source: &str,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let tree = self.parser.parse(source, None).ok_or("Failed to parse")?;
+    pub fn transpile_source(&mut self, source: &str) -> anyhow::Result<String> {
+        let tree = self.parser.parse(source, None).context("Failed to parse")?;
 
         let info = Self::collect_structure(source, tree.root_node(), &self.shared_paths);
         self.warnings = info.warnings.clone();
