@@ -39,6 +39,15 @@ Beyond plain method signatures, the same `#:` convention covers the shapes you a
 
 That last one — `# @rbs import` — is how you reuse a type across files without redefining it everywhere: Sentinel resolves it from `sig/shared/`, follows transitive references, and handles cycles. See the [feature comparison](./comparison.md) for the full annotation surface and where Sentinel and rbs-inline currently differ.
 
+## Where annotations are read
+
+Sentinel reads every `class` and `module` in a file, including ones nested inside each other, and writes them back out with the same nesting. A file can define as many as it likes, and scopes with nothing annotated are left out of the output.
+
+- A `def` wrapped in `private`, `protected`, `public`, `module_function` or `private_class_method` keeps its signature. It is written as a plain `def`: visibility is not emitted.
+- A `def` inside an `if`, `unless`, `case` or `begin` belongs to the enclosing class or module, so version-dependent methods work.
+- In an `ActiveSupport::Concern`, `def`s inside `class_methods do ... end` are class methods.
+- Annotated members inside any other block (`included do`, `Struct.new(...) do`, Thor's `no_commands do`) are **not** emitted, because the block runs in a different context from the class body. Sentinel warns with the line number instead of dropping them silently.
+
 ## No header required
 
 rbs-inline requires an opt-in header comment (`# rbs_inline: enabled`) at the top of every file it should process — useful for a gradual rollout, but one more thing to remember to add, and easy to silently skip a file. Sentinel has no such header: any file inside a watched folder (configured in `.sentinel.toml`) is scanned. That matters most when you're retrofitting types onto a large existing codebase, or a Rails engine, where you don't want to touch every file's top line just to opt it in.

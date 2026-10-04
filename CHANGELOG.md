@@ -3,9 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- **Every class and module in a file is transpiled** (#35). A file used to describe one scope, so nested classes, sibling classes, a module after a class, and the own methods of a module that also contained a nested class were silently dropped (a module with its own methods plus any nested class wrote no `.rbs` at all). Sentinel now builds a tree of scopes and emits all of them, nested as in the source, skipping scopes with nothing annotated. Checked against 3,433 files from `ruby/gem_rbs_collection`: the share whose output matches the source signatures went from 74% to 99%.
+- **`#:` above `private def` / `protected def` / `public def` / `module_function def` / `private_class_method def self.x`** is now attached to the method (#36). It is written as a plain `def`; visibility is not emitted.
+- **Annotated defs inside `if`/`unless`/`elsif`/`else`/`case`/`begin` bodies** belong to the enclosing class or module, and `class_methods do ... end` (ActiveSupport::Concern) declares class methods (#37).
+- **Warnings for annotated members inside any other block** (`included do`, `Struct.new(...) do`, Thor's `no_commands do`, ...): the block runs in a different context, so they are not emitted, and Sentinel now says so with the line number instead of dropping them silently (#37).
 - **`sentinel/transpile` request for `sentinel lsp`**: send `{ "text": "<ruby source>" }`, get back `{ "rbs": ..., "diagnostics": [...] }`, entirely in memory. It reads and writes no files and needs no `.sentinel.toml`, watched folder or `sig/generated`, so tools and pipelines can use one `sentinel lsp` process instead of building a directory structure. The diagnostics are the same plugin and annotation warnings the editor path publishes (`range.start.line` is the 0-based line in the submitted text). Existing `didOpen`/`didSave` behavior is unchanged. The transpiler gains `transpile_source(&str)`, and `transpile_file` is now a thin wrapper around it.
 - **More inline RBS forms** (#33): trailing `attr_reader :a #: String`, `# @rbs @ivar: T`, `# @rbs x: T` / `# @rbs return: T` (signature built from the def's parameters; untagged ones are `untyped`), and `# @rbs (Integer) -> String`.
 - **Warnings for annotations that can't be transpiled**: dangling `#:`/`@rbs` tags, unsupported `@rbs` tags and malformed signatures are reported with their line number: on stderr by `init`/`check`/`watch`, and as `sentinel::annotations` warning diagnostics by `sentinel lsp`.
+
+### Changed
+- `init`, `check` and `watch` run their CPU-bound, blocking work (the rayon batches, and the watcher's parse and write) on tokio's blocking pool instead of a runtime worker thread (#26). Behavior is unchanged; the one visible difference is that in the watcher, plugin warnings now print after the write rather than before it.
+- `transpile_file` and `transpile_source` return `anyhow::Result<String>` (`Send`, so the error crosses `spawn_blocking` intact) instead of `Box<dyn Error>`.
 
 ### Fixed
 - A trailing `#: T` after `attr_*` leaked onto the next `attr_*` line, giving it the wrong type.
