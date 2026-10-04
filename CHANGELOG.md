@@ -4,6 +4,7 @@
 
 ### Fixed
 - Annotated defs inside Thor's `no_commands do ... end` and `no_tasks do ... end` are emitted as ordinary members of the class instead of being dropped with a warning: those blocks are evaluated in the class body (#40).
+- A file with a syntax error is no longer transpiled silently. Tree-sitter recovers from the error, which could yield no output or output under the wrong namespace (a missing `end` on the outermost module dropped it) while the summary said `0 errors`. Sentinel now warns `syntax error; the generated RBS may be incomplete or wrongly namespaced` at the first error's line, through the usual warning path (`init`/`check`/`watch` stderr, `sentinel/transpile`, and an error-severity `sentinel::annotations` LSP diagnostic) (#42).
 
 ## [0.7.0] - 2026-10-03
 
