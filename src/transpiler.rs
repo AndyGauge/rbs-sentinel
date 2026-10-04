@@ -1138,9 +1138,17 @@ impl SentinelTranspiler {
         rb_path: &Path,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let source = fs::read_to_string(rb_path)?;
-        let tree = self.parser.parse(&source, None).ok_or("Failed to parse")?;
+        self.transpile_source(&source)
+    }
 
-        let info = Self::collect_structure(&source, tree.root_node(), &self.shared_paths);
+    /// Transpile Ruby `source` held in memory; no file is read or written.
+    pub fn transpile_source(
+        &mut self,
+        source: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let tree = self.parser.parse(source, None).ok_or("Failed to parse")?;
+
+        let info = Self::collect_structure(source, tree.root_node(), &self.shared_paths);
         self.warnings = info.warnings.clone();
 
         let mut rbs_output = String::new();
