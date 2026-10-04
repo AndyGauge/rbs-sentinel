@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-03
+
 ### Added
 - **Every class and module in a file is transpiled** (#35). A file used to describe one scope, so nested classes, sibling classes, a module after a class, and the own methods of a module that also contained a nested class were silently dropped (a module with its own methods plus any nested class wrote no `.rbs` at all). Sentinel now builds a tree of scopes and emits all of them, nested as in the source, skipping scopes with nothing annotated. Checked against 3,433 files from `ruby/gem_rbs_collection`: the share whose output matches the source signatures went from 74% to 99%.
 - **`#:` above `private def` / `protected def` / `public def` / `module_function def` / `private_class_method def self.x`** is now attached to the method (#36). It is written as a plain `def`; visibility is not emitted.
