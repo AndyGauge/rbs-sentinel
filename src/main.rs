@@ -1,6 +1,7 @@
 mod check;
 mod config;
 mod init;
+mod lsp;
 mod plugin;
 mod transpiler;
 mod watcher;
@@ -23,8 +24,8 @@ async fn main() -> Result<()> {
             for folder in config.folder_paths() {
                 // init::run fans out over files with rayon (a blocking call), so
                 // run it on the blocking pool rather than a tokio worker thread.
-                let (output, shared) = (output.clone(), shared.clone());
-                tokio::task::spawn_blocking(move || init::run(&folder, &output, &shared)).await?;
+                let (output, shared, emit) = (output.clone(), shared.clone(), config.emit_superclasses);
+                tokio::task::spawn_blocking(move || init::run(&folder, &output, &shared, emit)).await?;
             }
         }
         "check" => {
@@ -34,10 +35,9 @@ async fn main() -> Result<()> {
             let mut all_ok = true;
             for folder in config.folder_paths() {
                 // check::run is rayon-parallel and blocking; keep it off the runtime.
-                let (output, shared) = (output.clone(), shared.clone());
-                let ok =
-                    tokio::task::spawn_blocking(move || check::run(&folder, &output, &shared))
-                        .await?;
+                let (output, shared, emit) = (output.clone(), shared.clone(), config.emit_superclasses);
+                let ok = tokio::task::spawn_blocking(move || check::run(&folder, &output, &shared, emit))
+                    .await?;
                 if !ok {
                     all_ok = false;
                 }
@@ -53,10 +53,10 @@ async fn main() -> Result<()> {
             let shared = config.shared_type_paths();
             for folder in config.folder_paths() {
                 // Same blocking rayon batch as `init`, before the async watch loop starts.
-                let (output, shared) = (output.clone(), shared.clone());
-                tokio::task::spawn_blocking(move || init::run(&folder, &output, &shared)).await?;
+                let (output, shared, emit) = (output.clone(), shared.clone(), config.emit_superclasses);
+                tokio::task::spawn_blocking(move || init::run(&folder, &output, &shared, emit)).await?;
             }
-            let watcher = SentinelWatcher::new(&config)?.with_plugins();
+            let watcher = SentinelWatcher::new(&config)?;
             watcher.run().await;
         }
         "add" => {
@@ -93,9 +93,12 @@ async fn main() -> Result<()> {
             }
             println!("Output: {}", config.output);
         }
+        "lsp" => {
+            lsp::run().await;
+        }
         other => {
             eprintln!("Unknown command: {}", other);
-            eprintln!("Usage: sentinel [init|watch|check|add|remove|list]");
+            eprintln!("Usage: sentinel [init|watch|check|add|remove|list|lsp]");
             eprintln!();
             eprintln!("Commands:");
             eprintln!("  init           Generate RBS files for all watched folders");
@@ -104,6 +107,8 @@ async fn main() -> Result<()> {
             eprintln!("  add <folder>   Add a folder to the watch list");
             eprintln!("  remove <folder> Remove a folder from the watch list");
             eprintln!("  list           Show watched folders and output path");
+            eprintln!("  lsp            Run as a Language Server (stdio); publishes plugin");
+            eprintln!("                 diagnostics and syncs sig/generated on save");
             std::process::exit(1);
         }
     }

@@ -1,5 +1,51 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`sentinel/transpile` request for `sentinel lsp`**: send `{ "text": "<ruby source>" }`, get back `{ "rbs": ..., "diagnostics": [...] }`, entirely in memory. It reads and writes no files and needs no `.sentinel.toml`, watched folder or `sig/generated`, so tools and pipelines can use one `sentinel lsp` process instead of building a directory structure. The diagnostics are the same plugin and annotation warnings the editor path publishes (`range.start.line` is the 0-based line in the submitted text). Existing `didOpen`/`didSave` behavior is unchanged. The transpiler gains `transpile_source(&str)`, and `transpile_file` is now a thin wrapper around it.
+- **More inline RBS forms** (#33): trailing `attr_reader :a #: String`, `# @rbs @ivar: T`, `# @rbs x: T` / `# @rbs return: T` (signature built from the def's parameters; untagged ones are `untyped`), and `# @rbs (Integer) -> String`.
+- **Warnings for annotations that can't be transpiled**: dangling `#:`/`@rbs` tags, unsupported `@rbs` tags and malformed signatures are reported with their line number: on stderr by `init`/`check`/`watch`, and as `sentinel::annotations` warning diagnostics by `sentinel lsp`.
+
+### Fixed
+- A trailing `#: T` after `attr_*` leaked onto the next `attr_*` line, giving it the wrong type.
+- Malformed signatures (e.g. `-> oops(`) were emitted verbatim; they are now skipped with a warning.
+
+## [0.6.0] - 2026-09-27
+
+### Added
+- **`sentinel lsp`**: Sentinel now runs as its own Language Server (stdio, via `tower-lsp`). On `didOpen`/`didSave` it transpiles the file, writes the refreshed `.rbs` into `sig/generated` (same effect as `sentinel watch`), and publishes the annotation lint plugins' findings (void-argument, angle-bracket, type-case) as real `textDocument/publishDiagnostics`, anchored to the `#:` annotation line in the original `.rb` source — previously these only printed to whichever terminal was running `init`/`check`/`watch`. Runs alongside Steep (which still owns actual RBS type checking); see the README's Editor Setup section for Neovim/VS Code/Zed wiring.
+- **Docs site** at `book/` (mdBook, deployed to GitHub Pages) covering what RBS/inline RBS are, adding Steep, per-editor setup, CI, internals, and the rbs-inline comparison.
+- **Zed extension** (`editors/zed/`) registering `sentinel lsp` as a second Ruby language server.
+- **Windows binary** (`x86_64-pc-windows-gnu`, cross-compiled via `cargo-zigbuild`/zig, which bundles mingw-w64). GNU ABI only — `-windows-msvc` isn't buildable this way, since that needs Microsoft's own linker/SDK. The gem binstub already had a `windows` case in its OS detection but built the binary path without a `.exe` extension; fixed alongside this.
+
+### Fixed
+- **`Type Case` plugin missed lowercase primitives in named-positional-arg style**: `TypeCasePlugin` only matched `(string)` (bare single arg), `: string`, `[string]`, and `-> string` — it had no pattern for Sentinel's own `(Type paramName, ...)` positional-arg convention (e.g. `(string username, String password)`), so a lowercase type there produced invalid RBS with no warning from `init`/`check`/`watch`/`lsp`. Rewrote the check to use type-position context (after `(`, `,`, `[`, `:`, or `->`, skipping a keyword-arg name like `array:`) instead of four literal patterns.
+
+### Changed
+- **Plugins dispatch through a `Plugin` enum instead of `Vec<Box<dyn SentinelPlugin>>`.** The plugin set is small, fixed, and closed (nothing registers one from outside this crate), and every plugin struct is zero-sized, so the old `Box<dyn ...>` list paid a heap allocation per plugin — on every save, for the LSP — to get dynamic dispatch nothing needed. `Plugin::ALL` is a `const [Plugin; 3]`, confirmed 1 byte in size. Internal only: `SentinelWatcher` also dropped its `plugins` field and `with_plugins()` builder step (always uses `Plugin::ALL` now), which incidentally removes a footgun where forgetting that call used to silently run zero plugins.
+
+## [0.5.0] - 2026-07-31
+
+### Added
+- **`emit_superclasses` config option** (default `false`): emit `class Foo < Bar` instead of a bare `class Foo`.
+
+  Without a parent in the generated RBS, every class looks to Steep like it inherits from `Object`. Inherited methods, class-level DSL macros and inherited type aliases are therefore invisible — and because `Steep::Diagnostic::Ruby::NoMethod` is commonly disabled in `Steepfile`, a call to an inherited macro type-checks silently no matter what it is passed. Enabling this lets Steep resolve the parent and actually check those call sites.
+
+  ```toml
+  # .sentinel.toml
+  emit_superclasses = true
+  ```
+
+  ```rbs
+  # false (default)     # true
+  class User            class User < ApplicationRecord
+  ```
+
+  Off by default deliberately: turning it on makes Steep check inherited signatures for the first time, which surfaces pre-existing type errors. That is the intent, but it belongs in a deliberate migration rather than a version bump. On one ~5,500-file Rails app this changed 165 of 195 generated files and surfaced 12 previously-invisible diagnostics.
+
+  Parents that are not a plain constant path (`Struct.new(:a)`, `Class.new`, `Data.define(...)`) are skipped, since RBS cannot name an anonymous class. Modules never receive a parent. The path is emitted exactly as written, so a namespace-relative parent stays relative — RBS resolves it the same way Ruby does.
+
 ## [0.4.2] - 2026-05-11
 
 ### Added

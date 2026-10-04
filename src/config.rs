@@ -4,12 +4,21 @@ use std::path::{Path, PathBuf};
 
 const CONFIG_FILE: &str = ".sentinel.toml";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentinelConfig {
     pub folders: Vec<String>,
     pub output: String,
     #[serde(default = "default_shared_paths")]
     pub shared_paths: Vec<String>,
+    /// Emit `class Foo < Bar` instead of a bare `class Foo`.
+    ///
+    /// Off by default because it is not a no-op for existing projects: once Steep
+    /// can see a parent, it resolves inherited methods and class-level DSL calls
+    /// that were previously invisible, which surfaces pre-existing type errors.
+    /// That is the point of the flag, but it should be an explicit migration
+    /// rather than something an upgrade does to you.
+    #[serde(default)]
+    pub emit_superclasses: bool,
 }
 
 fn default_shared_paths() -> Vec<String> {
@@ -22,6 +31,7 @@ impl Default for SentinelConfig {
             folders: vec!["app".to_string()],
             output: "sig/generated".to_string(),
             shared_paths: default_shared_paths(),
+            emit_superclasses: false,
         }
     }
 }

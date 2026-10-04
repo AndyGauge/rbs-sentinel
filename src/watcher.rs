@@ -1,5 +1,5 @@
 use crate::config::SentinelConfig;
-use crate::plugin::{AngleBracketPlugin, SentinelPlugin, TypeCasePlugin, VoidArgumentPlugin};
+use crate::plugin::Plugin;
 use crate::transpiler::SentinelTranspiler;
 use anyhow::{Context, Result};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
@@ -15,7 +15,6 @@ pub struct SentinelWatcher {
     app_roots: Vec<PathBuf>,
     output_path: PathBuf,
     shared_paths: Vec<PathBuf>,
-    plugins: Vec<Box<dyn SentinelPlugin>>,
 }
 
 impl SentinelWatcher {
@@ -43,16 +42,7 @@ impl SentinelWatcher {
             app_roots,
             output_path: config.output_path(),
             shared_paths: config.shared_type_paths(),
-            plugins: Vec::new(),
         })
-    }
-
-    /// Register default plugins for RBS linting
-    pub fn with_plugins(mut self) -> Self {
-        self.plugins.push(Box::new(VoidArgumentPlugin));
-        self.plugins.push(Box::new(TypeCasePlugin));
-        self.plugins.push(Box::new(AngleBracketPlugin));
-        self
     }
 
     /// Check if a path is a real .rb file (not a temp file from sed, editors, etc.)
@@ -135,7 +125,7 @@ impl SentinelWatcher {
         // Tree-sitter parsing, the .rb read, and the .rbs write are blocking and
         // CPU-bound. Run them on the blocking pool, not a tokio worker thread.
         // The transpiler moves in and comes back out so we keep reusing it.
-        let (transpiler, result) = tokio::task::spawn_blocking(move || {
+        let (transpiler, result, warnings) = tokio::task::spawn_blocking(move || {
             let result = (|| -> anyhow::Result<String> {
                 let rbs = transpiler.transpile_file(&rb_path).context("transpiling")?;
                 if let Some(parent) = target.parent() {
@@ -144,15 +134,20 @@ impl SentinelWatcher {
                 std::fs::write(&target, &rbs).context("writing RBS")?;
                 Ok(rbs)
             })();
-            (transpiler, result)
+            // Taken here: it needs the transpiler, which is only ours inside this closure.
+            let warnings = transpiler.take_warnings();
+            (transpiler, result, warnings)
         })
         .await
         .expect("transpile task panicked");
 
+        for w in warnings {
+            eprintln!("⚠️  [warn] {}:{}: {}", path.display(), w.line, w.message);
+        }
         match result {
             Ok(rbs_content) => {
                 // Plugin lints are cheap string scans, so run them here.
-                for plugin in &self.plugins {
+                for plugin in Plugin::ALL {
                     let issues = plugin.check(&rbs_content);
                     if !issues.is_empty() {
                         eprintln!(

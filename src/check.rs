@@ -1,5 +1,5 @@
 use crate::init::derive_sig_path;
-use crate::plugin::{AngleBracketPlugin, SentinelPlugin, TypeCasePlugin, VoidArgumentPlugin};
+use crate::plugin::Plugin;
 use crate::transpiler::SentinelTranspiler;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 use walkdir::WalkDir;
 
-pub fn run(app_path: &Path, output_path: &Path, shared_paths: &[PathBuf]) -> bool {
+pub fn run(app_path: &Path, output_path: &Path, shared_paths: &[PathBuf], emit_superclasses: bool) -> bool {
     let start = Instant::now();
     let app_root = app_path
         .canonicalize()
@@ -31,12 +31,6 @@ pub fn run(app_path: &Path, output_path: &Path, shared_paths: &[PathBuf]) -> boo
     let total = files.len();
     println!("Checking {} Ruby files in {:?}", total, app_path);
 
-    let plugins: Vec<Box<dyn SentinelPlugin>> = vec![
-        Box::new(VoidArgumentPlugin),
-        Box::new(TypeCasePlugin),
-        Box::new(AngleBracketPlugin),
-    ];
-
     let stale_files: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     let missing_files: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     let checked = AtomicUsize::new(0);
@@ -45,16 +39,21 @@ pub fn run(app_path: &Path, output_path: &Path, shared_paths: &[PathBuf]) -> boo
 
     files.par_iter().for_each(|path| {
         let mut transpiler = SentinelTranspiler::new();
+        transpiler.set_emit_superclasses(emit_superclasses);
         transpiler.set_shared_paths(shared_paths.to_vec());
 
-        match transpiler.transpile_file(path) {
+        let result = transpiler.transpile_file(path);
+        for w in transpiler.take_warnings() {
+            eprintln!("  [warn] {}:{}: {}", path.display(), w.line, w.message);
+        }
+        match result {
             Ok(rbs_content) => {
                 if !SentinelTranspiler::has_content(&rbs_content) {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
 
-                for plugin in &plugins {
+                for plugin in Plugin::ALL {
                     let issues = plugin.check(&rbs_content);
                     if !issues.is_empty() {
                         eprintln!(
