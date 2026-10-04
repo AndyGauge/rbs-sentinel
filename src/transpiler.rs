@@ -539,7 +539,9 @@ impl SentinelTranspiler {
     }
 
     /// A block attached to a call in a class body. `class_methods do` (ActiveSupport::
-    /// Concern) declares class methods, so its defs are scanned as such. Any other block
+    /// Concern) declares class methods, so its defs are scanned as such. Thor's
+    /// `no_commands do` / `no_tasks do` are evaluated in the class body, so their defs are
+    /// ordinary members of the class. Any other block
     /// (`included do`, `Struct.new do`, ...) runs in a different context from the class
     /// body, so annotated members inside it are not emitted; say so instead of dropping
     /// them silently.
@@ -551,11 +553,15 @@ impl SentinelTranspiler {
         method_name: &str,
         info: &mut Scope,
         line: usize,
+        singleton_context: bool,
         shared_paths: &[std::path::PathBuf],
     ) {
         let inner = Self::flatten_children(block);
-        if method_name == "class_methods" && call.child_by_field_name("receiver").is_none() {
+        let receiverless = call.child_by_field_name("receiver").is_none();
+        if method_name == "class_methods" && receiverless {
             Self::scan_body(source, &inner, info, true, shared_paths);
+        } else if matches!(method_name, "no_commands" | "no_tasks") && receiverless {
+            Self::scan_body(source, &inner, info, singleton_context, shared_paths);
         } else {
             let mut scratch = Scope::new(String::new(), false);
             Self::scan_body(source, &inner, &mut scratch, false, shared_paths);
@@ -864,7 +870,7 @@ impl SentinelTranspiler {
                             (call.child_by_field_name("block"), call.child_by_field_name("method"))
                         {
                             let name = Self::node_text(source, &method);
-                            Self::scan_block(source, call, block, name, info, line, shared_paths);
+                            Self::scan_block(source, call, block, name, info, line, singleton_context, shared_paths);
                         }
                     }
                 }
@@ -939,7 +945,7 @@ impl SentinelTranspiler {
                         } else if let Some(block) = child.child_by_field_name("block") {
                             handled = true;
                             Self::warn_dropped(info, &mut pending_annotation, pending_ann_line, &mut pending_tags);
-                            Self::scan_block(source, child, block, method_name, info, line, shared_paths);
+                            Self::scan_block(source, child, block, method_name, info, line, singleton_context, shared_paths);
                         }
                     }
                     if !handled {
@@ -2769,6 +2775,16 @@ end
         let mut t = SentinelTranspiler::new();
         let out = t.transpile_file(&path).unwrap();
         (out, t.take_warnings().into_iter().map(|w| w.message).collect())
+    }
+
+    #[test]
+    fn thor_no_commands_blocks_are_class_body() {
+        let src = "class DevCommand < Thor\n  no_commands do\n    #: () -> void\n    def help\n      say \"usage\"\n    end\n  end\n\n  no_tasks do\n    #: (String) -> String\n    def render(name); name; end\n  end\n\n  #: () -> void\n  def run_it; end\nend\n";
+        let (out, warnings) = transpile_str("sentinel_thor_blocks.rb", src);
+        assert!(warnings.is_empty(), "{:?}", warnings);
+        assert!(out.contains("def help: () -> void"), "{}", out);
+        assert!(out.contains("def render: (String) -> String"), "{}", out);
+        assert!(out.contains("def run_it: () -> void"), "{}", out);
     }
 
     #[test]

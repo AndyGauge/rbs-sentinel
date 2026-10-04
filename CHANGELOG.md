@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Annotated defs inside Thor's `no_commands do ... end` and `no_tasks do ... end` are emitted as ordinary members of the class instead of being dropped with a warning: those blocks are evaluated in the class body (#40).
+
 ## [0.7.0] - 2026-10-03
 
 ### Added
