@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`sentinel/transpile` request for `sentinel lsp`**: send `{ "text": "<ruby source>" }`, get back `{ "rbs": ..., "diagnostics": [...] }`, entirely in memory. It reads and writes no files and needs no `.sentinel.toml`, watched folder or `sig/generated`, so tools and pipelines can use one `sentinel lsp` process instead of building a directory structure. The diagnostics are the same plugin and annotation warnings the editor path publishes (`range.start.line` is the 0-based line in the submitted text). Existing `didOpen`/`didSave` behavior is unchanged. The transpiler gains `transpile_source(&str)`, and `transpile_file` is now a thin wrapper around it.
+- **More inline RBS forms** (#33): trailing `attr_reader :a #: String`, `# @rbs @ivar: T`, `# @rbs x: T` / `# @rbs return: T` (signature built from the def's parameters; untagged ones are `untyped`), and `# @rbs (Integer) -> String`.
+- **Warnings for annotations that can't be transpiled**: dangling `#:`/`@rbs` tags, unsupported `@rbs` tags and malformed signatures are reported with their line number: on stderr by `init`/`check`/`watch`, and as `sentinel::annotations` warning diagnostics by `sentinel lsp`.
+
+### Fixed
+- A trailing `#: T` after `attr_*` leaked onto the next `attr_*` line, giving it the wrong type.
+- Malformed signatures (e.g. `-> oops(`) were emitted verbatim; they are now skipped with a warning.
+
 ## [0.6.0] - 2026-09-27
 
 ### Added
