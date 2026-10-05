@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-04
+
 ### Fixed
 - Annotated defs inside Thor's `no_commands do ... end` and `no_tasks do ... end` are emitted as ordinary members of the class instead of being dropped with a warning: those blocks are evaluated in the class body (#40).
 - A `#:` signature above a def with a trailing `if`/`unless` modifier (`def x; end unless method_defined?(:x)`, `private def x; end if cond`) is attached to the method instead of being reported as not attached (#41).
