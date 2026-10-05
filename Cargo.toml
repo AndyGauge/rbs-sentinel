@@ -1,6 +1,6 @@
 [package]
 name = "sentinel-rb"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 authors = ["Andy Gauger <https://github.com/andygauge>"]
 description = "High-speed Rust sidecar for Ruby Type-Safety and Agentic Orchestration"
